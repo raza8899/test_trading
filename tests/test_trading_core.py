@@ -23,6 +23,8 @@ from trading_core import (
     estimate_nse_equity_intraday_cost,
     gross_pnl,
     load_json_strict,
+    strict_finite_float,
+    strict_integral,
 )
 
 
@@ -107,6 +109,21 @@ class OrderSnapshotTests(unittest.TestCase):
         for payload in bad_payloads:
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 OrderSnapshot.from_payload(payload)
+
+
+class StrictBrokerValueTests(unittest.TestCase):
+    def test_signed_integral_parser_does_not_round_or_default(self) -> None:
+        self.assertEqual(strict_integral("-7", field="quantity"), -7)
+        self.assertEqual(strict_integral("4.0", field="quantity"), 4)
+        for value in (None, "", True, 1.5, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                strict_integral(value, field="quantity")
+
+    def test_finite_float_parser_rejects_missing_and_nonfinite(self) -> None:
+        self.assertEqual(strict_finite_float("-12.5", field="pnl"), -12.5)
+        for value in (None, "", False, "bad", float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                strict_finite_float(value, field="pnl")
 
 
 class JsonStateTests(unittest.TestCase):
@@ -214,6 +231,31 @@ class KiteBrokerAdapterTests(unittest.TestCase):
             }
         )
         self.assertEqual(broker._order_updates["OID1"].status, "COMPLETE")
+
+    def test_converted_stop_postback_cannot_regress_to_stale_slm_state(self) -> None:
+        _, broker = self.make_broker()
+        common = {
+            "order_id": "OID-STOP",
+            "quantity": 10,
+            "filled_quantity": 0,
+            "pending_quantity": 10,
+            "transaction_type": "SELL",
+            "tradingsymbol": "INFY",
+            "exchange": "NSE",
+            "product": "MIS",
+            "tag": "AISTP000000000001",
+            "trigger_price": 98.0,
+        }
+        broker._record_order_update(
+            {**common, "status": "OPEN", "order_type": "LIMIT"}
+        )
+        broker._record_order_update(
+            {**common, "status": "TRIGGER PENDING", "order_type": "SL-M"}
+        )
+
+        current = broker._order_updates["OID-STOP"]
+        self.assertEqual(current.status, "OPEN")
+        self.assertEqual(current.order_type, "LIMIT")
 
     def test_latest_order_falls_back_to_websocket_cache_on_rest_error(self) -> None:
         _, broker = self.make_broker()

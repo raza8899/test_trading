@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -75,6 +75,8 @@ def make_setup(side: str = "LONG"):
         nifty_return_pct=0.3 if side == "LONG" else -0.3,
         technical_score=90.0,
         signal_at=FIXED_NOW.isoformat(),
+        lower_circuit_limit=90.0,
+        upper_circuit_limit=110.0,
     )
 
 
@@ -124,6 +126,8 @@ class FakeBroker:
         self.recovered_by_tag: dict[str, object] = {}
         self.startup_order_payloads: list[dict] = []
         self.trade_payloads: list[dict] = []
+        self.order_metadata: dict[str, dict] = {}
+        self.wait_options: list[dict] = []
         self.ws_connected = mock.Mock()
         self.ws_connected.is_set.return_value = True
         self._instrument = bot.Instrument(
@@ -148,6 +152,14 @@ class FakeBroker:
 
     def place_market_entry(self, inst, side, qty, tag):
         self.entry_calls.append((inst.symbol, side, qty, tag))
+        self.order_metadata["ENTRY-1"] = {
+            "symbol": inst.symbol,
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "BUY" if side == "LONG" else "SELL",
+            "order_type": "MARKET",
+            "tag": tag,
+        }
         self.signed_qty = qty if side == "LONG" else -qty
         if self.raise_after_accept_entry:
             snapshot = bot.OrderSnapshot.from_payload(
@@ -173,12 +185,33 @@ class FakeBroker:
 
     def place_protective_stop(self, inst, side, qty, trigger_price, tag):
         self.stop_calls.append((inst.symbol, side, qty, trigger_price, tag))
+        self.order_metadata["STOP-1"] = {
+            "symbol": inst.symbol,
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "SELL" if side == "LONG" else "BUY",
+            "order_type": "SL-M",
+            "tag": tag,
+            "trigger_price": trigger_price,
+        }
         return "STOP-1"
+
+    def _enrich(self, order_id, snapshot):
+        metadata = self.order_metadata.get(order_id, {})
+        values = {
+            key: (
+                value
+                if key == "trigger_price"
+                else getattr(snapshot, key) or value
+            )
+            for key, value in metadata.items()
+        }
+        return replace(snapshot, **values) if values else snapshot
 
     def cancel_order_confirmed(self, order_id, *, timeout_seconds=8):
         self.cancel_calls.append(order_id)
         if order_id in self.cancel_snapshots:
-            snapshot = self.cancel_snapshots[order_id]
+            snapshot = self._enrich(order_id, self.cancel_snapshots[order_id])
             if snapshot.transaction_type == "BUY":
                 self.signed_qty = snapshot.filled
             elif snapshot.transaction_type == "SELL":
@@ -190,6 +223,14 @@ class FakeBroker:
 
     def exit_market(self, inst, signed_qty, tag):
         self.exit_calls.append((inst.symbol, signed_qty, tag))
+        self.order_metadata["EXIT-1"] = {
+            "symbol": inst.symbol,
+            "exchange": "NSE",
+            "product": "MIS",
+            "transaction_type": "SELL" if signed_qty > 0 else "BUY",
+            "order_type": "MARKET",
+            "tag": tag,
+        }
         if self.raise_after_accept_exit:
             snapshot = bot.OrderSnapshot.from_payload(
                 {
@@ -218,11 +259,19 @@ class FakeBroker:
         *,
         timeout_seconds,
         require_stop_armed=False,
+        return_on_partial=False,
     ):
+        self.wait_options.append(
+            {
+                "order_id": order_id,
+                "require_stop_armed": require_stop_armed,
+                "return_on_partial": return_on_partial,
+            }
+        )
         if order_id in self.order_snapshots:
-            return self.order_snapshots[order_id]
+            return self._enrich(order_id, self.order_snapshots[order_id])
         if order_id == "STOP-1" or require_stop_armed:
-            return bot.OrderSnapshot.from_payload(
+            return self._enrich(order_id, bot.OrderSnapshot.from_payload(
                 {
                     "order_id": order_id,
                     "status": "TRIGGER PENDING",
@@ -231,8 +280,8 @@ class FakeBroker:
                     "pending_quantity": 10,
                     "trigger_price": 98.0,
                 }
-            )
-        return bot.OrderSnapshot.from_payload(
+            ))
+        return self._enrich(order_id, bot.OrderSnapshot.from_payload(
             {
                 "order_id": order_id,
                 "status": "COMPLETE",
@@ -241,7 +290,7 @@ class FakeBroker:
                 "pending_quantity": 0,
                 "average_price": self.current_price,
             }
-        )
+        ))
 
     def wait_for_position_qty(
         self,
@@ -292,6 +341,12 @@ class FakeAIReviewer:
         self.last_response_id = "fake-response"
         self.last_latency_ms = 1
         self.last_error = ""
+        self.last_status = "OK"
+        self.last_decision_id = "fake-decision"
+        self.last_input_sha256 = "fake-input"
+        self.last_input_tokens = 10
+        self.last_output_tokens = 5
+        self.last_total_tokens = 15
 
     def review(self, setup):
         self.review_calls.append(setup)
@@ -334,6 +389,252 @@ class StrategyHelperSafetyTests(unittest.TestCase):
             self.assertAlmostEqual(bot.paper_fill_price(100.0, "BUY"), 100.05)
             self.assertAlmostEqual(bot.paper_fill_price(100.0, "SELL"), 99.95)
 
+    def test_after_cost_payoff_gate_rejects_low_volatility_friction(self) -> None:
+        broker = FakeBroker()
+        low_volatility = replace(
+            make_setup(),
+            atr=0.25,
+            atr_pct=0.0025,
+            lower_circuit_limit=80.0,
+            upper_circuit_limit=120.0,
+        )
+        ordinary_volatility = replace(
+            make_setup(),
+            atr=1.0,
+            atr_pct=0.01,
+            lower_circuit_limit=80.0,
+            upper_circuit_limit=120.0,
+        )
+
+        rejected = bot.build_trade_result(broker, low_volatility)
+        accepted = bot.build_trade_result(broker, ordinary_volatility)
+
+        self.assertIsNone(rejected.trade)
+        self.assertIn("AFTER_COST_PAYOFF", rejected.reason)
+        self.assertIsNotNone(accepted.trade)
+        self.assertGreaterEqual(
+            accepted.trade.planned_after_cost_payoff,
+            bot.MIN_AFTER_COST_PAYOFF_RATIO,
+        )
+        self.assertLessEqual(
+            accepted.trade.planned_risk_amount,
+            bot.CAPITAL_LIMIT * bot.RISK_PER_TRADE_PCT,
+        )
+
+    def test_directional_circuit_geometry_rejects_unfillable_stop(self) -> None:
+        broker = FakeBroker()
+        setup = replace(
+            make_setup(),
+            atr=1.0,
+            atr_pct=0.01,
+            lower_circuit_limit=99.0,
+            upper_circuit_limit=110.0,
+        )
+
+        result = bot.build_trade_result(broker, setup)
+
+        self.assertIsNone(result.trade)
+        self.assertEqual(result.reason, "LONG_STOP_OUTSIDE_PRICE_BAND")
+
+    def test_modeled_adverse_fill_uses_exact_execution_risk_geometry(self) -> None:
+        broker = FakeBroker()
+        long_setup = replace(
+            make_setup("LONG"),
+            price=50.0,
+            atr=0.305,
+            atr_pct=0.0061,
+            lower_circuit_limit=40.0,
+            upper_circuit_limit=50.76,
+        )
+        short_setup = replace(
+            make_setup("SHORT"),
+            price=50.0,
+            atr=0.305,
+            atr_pct=0.0061,
+            lower_circuit_limit=49.24,
+            upper_circuit_limit=60.0,
+        )
+
+        long_result = bot.build_trade_result(broker, long_setup)
+        short_result = bot.build_trade_result(broker, short_setup)
+
+        self.assertEqual(long_result.reason, "MODELED_LONG_TARGET_OUTSIDE_PRICE_BAND")
+        self.assertEqual(short_result.reason, "MODELED_SHORT_TARGET_OUTSIDE_PRICE_BAND")
+
+    def test_malformed_matching_fill_cannot_produce_partial_average(self) -> None:
+        broker = FakeBroker()
+        broker.trade_payloads = [
+            {"order_id": "EXIT-1", "quantity": 2, "average_price": 100.0},
+            {"order_id": "EXIT-1", "quantity": 1.5, "average_price": 101.0},
+        ]
+
+        with self.assertRaises(ValueError):
+            bot.broker_fill_average(broker, ["EXIT-1"])
+
+    def test_remaining_daily_loss_and_open_risk_reduce_entry_budget(self) -> None:
+        state = bot.fresh_state()
+        state["realized_pnl"] = -700.0
+
+        capacity = bot.entry_capacity(state)
+        self.assertAlmostEqual(capacity.candidate_risk_budget, 100.0)
+
+        open_trade = make_trade(status="OPEN_PROTECTED")
+        open_trade.execution_mode = "paper"
+        open_trade.planned_risk_amount = 100.0
+        open_trade.reserved_risk_amount = 100.0
+        state["trades"][open_trade.symbol] = asdict(open_trade)
+
+        exhausted = bot.entry_capacity(state)
+        self.assertFalse(exhausted.allowed)
+        self.assertEqual(exhausted.candidate_risk_budget, 0.0)
+
+    def test_positive_realized_pnl_does_not_expand_per_trade_budget(self) -> None:
+        state = bot.fresh_state()
+        state["realized_pnl"] = 10_000.0
+
+        capacity = bot.entry_capacity(state)
+
+        self.assertEqual(
+            capacity.candidate_risk_budget,
+            bot.CAPITAL_LIMIT * bot.RISK_PER_TRADE_PCT,
+        )
+
+    def test_adverse_entry_notional_is_reserved_below_position_cap(self) -> None:
+        broker = FakeBroker(price=50.40)
+        setup = replace(
+            make_setup(),
+            price=50.40,
+            atr=0.23184,
+            atr_pct=0.0046,
+            lower_circuit_limit=40.0,
+            upper_circuit_limit=60.0,
+        )
+
+        result = bot.build_trade_result(broker, setup)
+
+        self.assertEqual(result.reason, "OK")
+        self.assertIsNotNone(result.trade)
+        cap = bot.CAPITAL_LIMIT * bot.MAX_POSITION_PCT
+        self.assertLessEqual(result.trade.reserved_notional_amount, cap)
+        self.assertLessEqual(result.outcome.entry_fill * result.trade.qty, cap)
+
+    def test_gross_capacity_counts_reserved_adverse_entry_notional(self) -> None:
+        state = bot.fresh_state()
+        first = make_trade(status="OPEN_PROTECTED")
+        first.symbol = "INFY"
+        first.execution_mode = "paper"
+        first.reserved_risk_amount = 100.0
+        first.reserved_notional_amount = 25_000.0
+        second = replace(first, symbol="TCS", token=456)
+        state["trades"] = {
+            first.symbol: asdict(first),
+            second.symbol: asdict(second),
+        }
+
+        capacity = bot.entry_capacity(state)
+
+        self.assertFalse(capacity.allowed)
+        self.assertEqual(capacity.gross_notional_remaining, 0.0)
+
+    def test_live_account_preflight_rejects_untracked_position(self) -> None:
+        broker = FakeBroker(signed_qty=10)
+
+        with self.assertRaisesRegex(RuntimeError, "do not match"):
+            bot.verify_live_account_matches_state(broker, bot.fresh_state())
+
+    def test_protected_limit_order_types_retain_role_identity(self) -> None:
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.entry_order_id = "ENTRY-1"
+        trade.entry_tag = "AIENT000000000001"
+        trade.stop_order_id = "STOP-1"
+        trade.stop_tag = "AISTP000000000001"
+        trade.exit_order_id = "EXIT-1"
+        trade.exit_order_ids = ["EXIT-1"]
+        trade.exit_tags = ["AIEXT000000000001"]
+        entry = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "ENTRY-1",
+                "status": "COMPLETE",
+                "quantity": 10,
+                "filled_quantity": 10,
+                "order_type": "LIMIT",
+                "transaction_type": "BUY",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.entry_tag,
+            }
+        )
+        stop = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "STOP-1",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "pending_quantity": 10,
+                "order_type": "LIMIT",
+                "transaction_type": "SELL",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.stop_tag,
+                "trigger_price": 98.0,
+            }
+        )
+        exit_order = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "EXIT-1",
+                "status": "COMPLETE",
+                "quantity": 10,
+                "filled_quantity": 10,
+                "order_type": "LIMIT",
+                "transaction_type": "SELL",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.exit_tags[0],
+            }
+        )
+        instrument = bot.Instrument("INFY", "Infosys", 123, 0.05)
+
+        self.assertTrue(bot.entry_identity_matches(entry, trade))
+        self.assertTrue(bot.stop_identity_matches(stop, trade, 10, instrument))
+        self.assertTrue(bot.exit_identity_matches(exit_order, trade))
+        self.assertFalse(
+            bot.exit_identity_matches(
+                replace(exit_order, transaction_type="BUY"),
+                trade,
+            )
+        )
+
+    def test_invalid_position_payload_never_means_flat(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "quantity"):
+            bot.parse_mis_position_quantities(
+                [
+                    {
+                        "exchange": "NSE",
+                        "product": "MIS",
+                        "tradingsymbol": "INFY",
+                    }
+                ]
+            )
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            bot.parse_mis_position_quantities(
+                [
+                    {
+                        "exchange": "NSE",
+                        "product": "MIS",
+                        "tradingsymbol": "INFY",
+                        "quantity": 1,
+                    },
+                    {
+                        "exchange": "NSE",
+                        "product": "MIS",
+                        "tradingsymbol": "INFY",
+                        "quantity": 0,
+                    },
+                ]
+            )
+
 
 class ConfigurationSafetyTests(unittest.TestCase):
     def test_live_mode_requires_exact_confirmation(self) -> None:
@@ -358,13 +659,21 @@ class ConfigurationSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "AI_MODE=off or AI_MODE=gate"):
                 bot.validate_configuration()
 
+    def test_risk_slippage_must_cover_paper_slippage(self) -> None:
+        with (
+            mock.patch.object(bot, "PAPER_SLIPPAGE_BPS", 50.0),
+            mock.patch.object(bot, "RISK_SLIPPAGE_BPS", 0.0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "at least PAPER_SLIPPAGE"):
+                bot.validate_configuration()
+
 
 class StateSafetyTests(IsolatedBotTestCase):
     def test_bot_state_round_trip_preserves_active_trade(self) -> None:
         state = bot.fresh_state()
-        state["trades"]["INFY"] = asdict(
-            make_trade(status="OPEN_PROTECTED")
-        )
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "paper"
+        state["trades"]["INFY"] = asdict(trade)
         bot.save_state(state)
 
         loaded = bot.load_state()
@@ -379,8 +688,85 @@ class StateSafetyTests(IsolatedBotTestCase):
         with self.assertRaisesRegex(RuntimeError, "corrupt or unreadable"):
             bot.load_state()
 
+    def test_active_live_state_cannot_restart_as_paper(self) -> None:
+        state = bot.fresh_state()
+        state["execution_mode"] = "live"
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "live"
+        trade.entry_order_id = "REAL-ENTRY"
+        state["trades"][trade.symbol] = asdict(trade)
+        bot.save_state(state)
+
+        with self.assertRaisesRegex(RuntimeError, "cannot start in paper mode"):
+            bot.load_state()
+
+    def test_previous_date_active_state_is_not_silently_discarded(self) -> None:
+        state = bot.fresh_state()
+        state["date"] = "2026-08-10"
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "paper"
+        trade.entry_order_id = "DRY-ENTRY-INFY"
+        state["trades"][trade.symbol] = asdict(trade)
+        bot.save_state(state)
+
+        with self.assertRaisesRegex(RuntimeError, "Previous-date active state"):
+            bot.load_state()
+
+    def test_explicit_paper_label_cannot_hide_real_order_ids(self) -> None:
+        state = bot.fresh_state()
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "paper"
+        trade.entry_order_id = "REAL-ENTRY"
+        trade.stop_order_id = "REAL-STOP"
+        state["trades"][trade.symbol] = asdict(trade)
+        bot.save_state(state)
+
+        with self.assertRaisesRegex(RuntimeError, "labelled paper"):
+            bot.load_state()
+
+    def test_failed_persist_restores_previous_in_memory_trade(self) -> None:
+        state = bot.fresh_state()
+        existing = make_trade(status="OPEN_PROTECTED")
+        existing.execution_mode = "paper"
+        state["trades"][existing.symbol] = asdict(existing)
+        changed = replace(existing, status="EXIT_PENDING")
+
+        with mock.patch.object(bot, "save_state", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                bot.persist_trade(state, changed)
+
+        self.assertEqual(state["trades"][existing.symbol]["status"], "OPEN_PROTECTED")
+
 
 class PaperExecutionLifecycleTests(IsolatedBotTestCase):
+    def test_post_fill_notional_breach_invokes_fail_safe(self) -> None:
+        broker = FakeBroker(price=100.0)
+        state = bot.fresh_state()
+        trade = make_trade()
+        trade.qty = 250
+        trade.requested_qty = 250
+        trade.initial_risk_per_share = 0.30
+        trade.stop_price = 99.70
+        trade.target_price = 100.55
+        trade.planned_risk_amount = 100.0
+        trade.reserved_risk_amount = 100.0
+        trade.reserved_notional_amount = 25_000.0
+
+        with mock.patch.object(bot, "fail_safe_trade_lifecycle") as fail_safe:
+            bot.execute_trade(
+                broker,
+                trade,
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        fail_safe.assert_called_once()
+        self.assertIn(
+            "REMAINING_GROSS_EXPOSURE_EXCEEDED",
+            fail_safe.call_args.args[3],
+        )
+
     def _open_paper_trade(self):
         broker = FakeBroker(price=100.0)
         state = bot.fresh_state()
@@ -438,8 +824,161 @@ class PaperExecutionLifecycleTests(IsolatedBotTestCase):
         self.assertEqual(state["consecutive_losses"], 0)
         self.assertEqual(bot.open_trade_count(state), 0)
 
+    def test_quote_failure_closes_unpriced_instead_of_using_target(self) -> None:
+        broker, state, _ = self._open_paper_trade()
+
+        with mock.patch.object(broker, "ltp", side_effect=TimeoutError("stale")):
+            result = bot.close_trade_market(
+                broker,
+                state,
+                "INFY",
+                "FORCE_EXIT_1510",
+            )
+
+        closed = bot.trade_from_dict(state["trades"]["INFY"])
+        self.assertTrue(result)
+        self.assertEqual(closed.status, "CLOSED_UNPRICED")
+        self.assertEqual(closed.net_pnl, 0.0)
+        self.assertEqual(state["realized_pnl"], 0.0)
+        self.assertTrue(state["kill_switch"])
+
+    def test_entry_cutoff_blocks_direct_execution(self) -> None:
+        broker = FakeBroker()
+        state = bot.fresh_state()
+        after_cutoff = FIXED_NOW.replace(hour=14, minute=30)
+
+        with mock.patch.object(bot, "now_ist", return_value=after_cutoff):
+            bot.execute_trade(
+                broker,
+                make_trade(),
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        self.assertEqual(broker.entry_calls, [])
+        self.assertNotIn("INFY", state["trades"])
+
+    def test_cutoff_crossed_while_persisting_intent_aborts_before_entry(self) -> None:
+        broker = FakeBroker()
+        state = bot.fresh_state()
+
+        with mock.patch.object(
+            bot,
+            "entry_window_open",
+            side_effect=[True, True, False],
+        ):
+            bot.execute_trade(
+                broker,
+                make_trade(),
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        trade = bot.trade_from_dict(state["trades"]["INFY"])
+        self.assertEqual(trade.status, "ABORTED")
+        self.assertEqual(trade.reserved_risk_amount, 0.0)
+        self.assertEqual(state["trades_today"], 0)
+
+    def test_post_fill_journal_failure_does_not_block_protection(self) -> None:
+        broker = FakeBroker()
+        state = bot.fresh_state()
+
+        def flaky_journal(event, **fields):
+            if event == "ENTRY_FILLED":
+                raise OSError("disk full")
+
+        with mock.patch.object(bot, "journal", side_effect=flaky_journal):
+            bot.execute_trade(
+                broker,
+                make_trade(),
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        trade = bot.trade_from_dict(state["trades"]["INFY"])
+        self.assertEqual(trade.status, "OPEN_PROTECTED")
+        self.assertTrue(trade.stop_order_id.startswith("DRY-STOP-"))
+
 
 class LiveExecutionInvariantTests(IsolatedBotTestCase):
+    def test_unresolved_stop_cancellation_blocks_separate_emergency_exit(self) -> None:
+        broker = FakeBroker(price=100.0, signed_qty=10)
+        trade = make_trade(status="HALTED_UNCERTAIN")
+        trade.execution_mode = "live"
+        trade.entry_order_id = "ENTRY-1"
+        trade.entry_tag = "AIENT000000000001"
+        trade.stop_order_id = "STOP-1"
+        trade.stop_tag = "AISTP000000000001"
+        broker.order_snapshots["ENTRY-1"] = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "ENTRY-1",
+                "status": "COMPLETE",
+                "quantity": 10,
+                "filled_quantity": 10,
+                "transaction_type": "BUY",
+                "order_type": "LIMIT",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.entry_tag,
+            }
+        )
+        broker.order_snapshots["STOP-1"] = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "STOP-1",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "pending_quantity": 10,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.stop_tag,
+                "trigger_price": 98.0,
+            }
+        )
+
+        real_cancel = broker.cancel_order_confirmed
+
+        def cancel(order_id, *, timeout_seconds=8):
+            if order_id == "STOP-1":
+                raise TimeoutError("stop cancellation unknown")
+            return real_cancel(order_id, timeout_seconds=timeout_seconds)
+
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(broker, "cancel_order_confirmed", side_effect=cancel),
+        ):
+            flattened = bot.emergency_flatten_without_state(
+                broker,
+                trade,
+                "TEST",
+            )
+
+        self.assertFalse(flattened)
+        self.assertEqual(broker.exit_calls, [])
+
+    def test_unknown_authoritative_pnl_halts_and_flattens(self) -> None:
+        broker = FakeBroker(signed_qty=10)
+        broker.current_intraday_pnl = mock.Mock(side_effect=ValueError("missing pnl"))
+        state = bot.fresh_state()
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "live"
+        state["trades"][trade.symbol] = asdict(trade)
+
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "flatten_all", return_value=True) as flatten,
+        ):
+            bot.enforce_daily_pnl_limit(broker, state)
+
+        self.assertTrue(state["kill_switch"])
+        flatten.assert_called_once_with(broker, state, "PNL_DATA_UNAVAILABLE")
+
     def test_completed_exit_is_not_closed_until_position_is_flat(self) -> None:
         broker = FakeBroker(price=104.0, signed_qty=10)
         broker.flat_confirmation = False
@@ -447,8 +986,41 @@ class LiveExecutionInvariantTests(IsolatedBotTestCase):
         trade = make_trade(status="OPEN_PROTECTED")
         trade.entry_order_id = "ENTRY-1"
         trade.stop_order_id = "STOP-1"
+        trade.entry_tag = "AIENT000000000001"
+        trade.stop_tag = "AISTP000000000001"
+        trade.execution_mode = "live"
         trade.entry_status = "COMPLETE"
-        trade.stop_status = "TRIGGER PENDING"
+        trade.stop_status = "CANCELLED"
+        broker.order_snapshots["ENTRY-1"] = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "ENTRY-1",
+                "status": "COMPLETE",
+                "quantity": 10,
+                "filled_quantity": 10,
+                "average_price": 100.0,
+                "transaction_type": "BUY",
+                "order_type": "LIMIT",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.entry_tag,
+            }
+        )
+        broker.order_snapshots["STOP-1"] = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "STOP-1",
+                "status": "CANCELLED",
+                "quantity": 10,
+                "filled_quantity": 0,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": trade.stop_tag,
+                "trigger_price": 98.0,
+            }
+        )
         state["trades"][trade.symbol] = asdict(trade)
 
         with mock.patch.object(bot, "LIVE_TRADING", True):
@@ -552,6 +1124,52 @@ class LiveFaultRecoveryTests(IsolatedBotTestCase):
         self.assertEqual(len(broker.stop_calls), 1)
         self.assertEqual(broker.stop_calls[0][2], 4)
         self.assertEqual(broker.order_snapshots["STOP-1"].pending, 4)
+        self.assertTrue(
+            any(
+                option["order_id"] == "ENTRY-1"
+                and option["return_on_partial"]
+                for option in broker.wait_options
+            )
+        )
+        expected = bot.estimate_after_cost_outcome(
+            trade.side,
+            trade.entry_price,
+            trade.initial_risk_per_share,
+            trade.initial_risk_per_share * bot.TARGET_R_MULTIPLE,
+            trade.qty,
+            broker._instrument.tick_size,
+            include_entry_slippage=False,
+        )
+        self.assertAlmostEqual(trade.reserved_risk_amount, expected.stop_loss)
+
+    def test_state_write_failure_after_fill_forces_flat_account(self) -> None:
+        broker = FakeBroker(price=100.20)
+        calls = 0
+        real_save_state = bot.save_state
+
+        def fail_third_save(state):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("disk full after fill")
+            return real_save_state(state)
+
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "save_state", side_effect=fail_third_save),
+        ):
+            state = bot.fresh_state()
+            bot.execute_trade(
+                broker,
+                make_trade(),
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        self.assertEqual(broker.signed_qty, 0)
+        self.assertTrue(state["kill_switch"])
+        self.assertGreaterEqual(len(broker.exit_calls), 1)
 
     def test_ambiguous_exit_response_recovers_and_second_close_is_idempotent(self) -> None:
         broker = FakeBroker(price=104.0, signed_qty=10)
@@ -581,9 +1199,29 @@ class LiveFaultRecoveryTests(IsolatedBotTestCase):
         trade = make_trade(status="OPEN_PROTECTED")
         trade.entry_order_id = "ENTRY-1"
         trade.stop_order_id = "STOP-1"
+        trade.entry_tag = "AIENT000000000001"
+        trade.stop_tag = "AISTP000000000001"
+        trade.execution_mode = "live"
         trade.entry_status = "COMPLETE"
         trade.stop_status = "CANCELLED"
         state["trades"][trade.symbol] = asdict(trade)
+        broker.order_snapshots["ENTRY-1"] = replace(
+            broker.order_snapshots["ENTRY-1"],
+            order_type="LIMIT",
+            symbol="INFY",
+            exchange="NSE",
+            product="MIS",
+            tag=trade.entry_tag,
+        )
+        broker.order_snapshots["STOP-1"] = replace(
+            broker.order_snapshots["STOP-1"],
+            order_type="SL-M",
+            symbol="INFY",
+            exchange="NSE",
+            product="MIS",
+            tag=trade.stop_tag,
+            trigger_price=98.0,
+        )
 
         with mock.patch.object(bot, "LIVE_TRADING", True):
             first = bot.close_trade_market(broker, state, trade.symbol, "TARGET")
@@ -653,7 +1291,11 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
                 "revalidate_live_setup",
                 return_value=(setup, ""),
             ),
-            mock.patch.object(bot, "build_trade", return_value=make_trade()),
+            mock.patch.object(
+                bot,
+                "build_trade_result",
+                return_value=bot.TradeBuildResult(make_trade(), "OK"),
+            ),
             mock.patch.object(bot, "execute_trade") as execute,
             mock.patch.object(bot, "journal"),
             mock.patch.object(bot.time, "sleep"),
@@ -691,6 +1333,12 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
         reviewer, execute = self._run_scan("shadow", rejection)
 
         self.assertEqual(len(reviewer.review_calls), 1)
+        model_payload = reviewer.review_calls[0]
+        rendered = bot.stable_json_sha256(model_payload)
+        self.assertNotIn("symbol", model_payload["setup"])
+        self.assertNotIn("token", model_payload["setup"])
+        self.assertNotIn("technical_score", model_payload["setup"])
+        self.assertEqual(len(rendered), 64)
         execute.assert_called_once()
         self.assertIs(execute.call_args.args[3], rejection)
 

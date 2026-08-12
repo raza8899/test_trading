@@ -3,14 +3,17 @@
 
 Only CLOSE events with explicit, finite ``net_pnl``, ``gross_pnl``, ``fees``,
 and ``r_multiple`` are included.  They must also have a recognised
-``ai_decision`` (``APPROVE``, ``REJECT``, or ``OFF``), except that a missing
+``ai_decision`` (``APPROVE``, ``REJECT``, ``ERROR``, or ``OFF``), except that a missing
 decision is accepted when ``ai_mode`` is explicitly ``off``.  Older CLOSE
 events are reported as incomplete and excluded; this module never reconstructs
 or guesses P&L from entry prices, exit reasons, or other journal events.
 
 Profit factor, expectancy, win rate, and drawdown use net P&L.  Drawdown follows
 the append order of lexically sorted input paths, then line order within each
-file, matching the normal ``trades_YYYYMMDD.jsonl`` journal layout.
+file, matching the normal ``trades_YYYYMMDD.jsonl`` journal layout.  Provenance
+metadata is not required for legacy P&L to remain calculable, but reports mark
+mixed or unverifiable experiments explicitly rather than implying that their
+aggregate is a like-for-like comparison.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 LOG_PATTERN = "trades_*.jsonl"
 NUMERIC_FIELDS = ("net_pnl", "gross_pnl", "fees", "r_multiple")
 AI_COHORT_DECISIONS = ("APPROVE", "REJECT")
-VALID_AI_DECISIONS = (*AI_COHORT_DECISIONS, "OFF")
+VALID_AI_DECISIONS = (*AI_COHORT_DECISIONS, "ERROR", "OFF")
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,11 @@ class TradeRecord:
     fees: float
     r_multiple: float
     ai_decision: str
+    execution_mode: str | None = None
+    config_fingerprint: str | None = None
+    ai_mode: str | None = None
+    ai_response_model: str | None = None
+    ai_prompt_version: str | None = None
 
 
 @dataclass
@@ -85,6 +93,23 @@ def _finite_number(value: Any) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _optional_text(
+    payload: dict[str, Any],
+    *names: str,
+    lowercase: bool = False,
+) -> str | None:
+    """Read optional provenance text without making legacy records incomplete."""
+
+    for name in names:
+        value = payload.get(name)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if text:
+            return text.lower() if lowercase else text
+    return None
 
 
 def _close_event_to_trade(
@@ -132,6 +157,19 @@ def _close_event_to_trade(
             fees=numbers["fees"],
             r_multiple=numbers["r_multiple"],
             ai_decision=decision,
+            execution_mode=_optional_text(
+                payload,
+                "execution_mode",
+                lowercase=True,
+            ),
+            config_fingerprint=_optional_text(payload, "config_fingerprint"),
+            ai_mode=_optional_text(payload, "ai_mode", lowercase=True),
+            ai_response_model=_optional_text(
+                payload,
+                "ai_response_model",
+                "ai_model",
+            ),
+            ai_prompt_version=_optional_text(payload, "ai_prompt_version"),
         ),
         [],
     )
@@ -239,6 +277,182 @@ def summarize_trades(records: Sequence[TradeRecord]) -> dict[str, Any]:
     }
 
 
+def _provenance_counts(
+    records: Sequence[TradeRecord],
+    field_name: str,
+) -> dict[str, int]:
+    counts = Counter(
+        value
+        for record in records
+        for value in [getattr(record, field_name)]
+        if value is not None
+    )
+    return dict(sorted(counts.items()))
+
+
+def summarize_provenance(records: Sequence[TradeRecord]) -> dict[str, Any]:
+    """Describe whether aggregated records are comparable experiments."""
+
+    count = len(records)
+    execution_modes = _provenance_counts(records, "execution_mode")
+    config_fingerprints = _provenance_counts(records, "config_fingerprint")
+    missing_execution_mode = sum(record.execution_mode is None for record in records)
+    missing_config_fingerprint = sum(
+        record.config_fingerprint is None for record in records
+    )
+    unknown_execution_modes = sorted(
+        mode for mode in execution_modes if mode not in {"live", "paper"}
+    )
+
+    compatibility_issues: list[str] = []
+    if len(execution_modes) > 1:
+        compatibility_issues.append("mixed_execution_modes")
+    if unknown_execution_modes:
+        compatibility_issues.append("unrecognized_execution_modes")
+    if missing_execution_mode:
+        compatibility_issues.append("missing_execution_mode")
+    if len(config_fingerprints) > 1:
+        compatibility_issues.append("mixed_config_fingerprints")
+    if missing_config_fingerprint:
+        compatibility_issues.append("missing_config_fingerprint")
+
+    if not count:
+        compatibility_status = "unknown_no_records"
+    elif any(issue.startswith("mixed_") for issue in compatibility_issues):
+        compatibility_status = "incompatible_mixed"
+    elif compatibility_issues:
+        compatibility_status = "unverified"
+    else:
+        compatibility_status = "compatible"
+
+    ai_records = [record for record in records if record.ai_decision != "OFF"]
+    ai_response_models = _provenance_counts(ai_records, "ai_response_model")
+    ai_prompt_versions = _provenance_counts(ai_records, "ai_prompt_version")
+    missing_ai_response_model = sum(
+        record.ai_response_model is None for record in ai_records
+    )
+    missing_ai_prompt_version = sum(
+        record.ai_prompt_version is None for record in ai_records
+    )
+    ai_issues: list[str] = []
+    if len(ai_response_models) > 1:
+        ai_issues.append("mixed_ai_response_models")
+    if missing_ai_response_model:
+        ai_issues.append("missing_ai_response_model")
+    if len(ai_prompt_versions) > 1:
+        ai_issues.append("mixed_ai_prompt_versions")
+    if missing_ai_prompt_version:
+        ai_issues.append("missing_ai_prompt_version")
+
+    if not ai_records:
+        ai_status = "not_applicable"
+    elif any(issue.startswith("mixed_") for issue in ai_issues):
+        ai_status = "incompatible_mixed"
+    elif ai_issues:
+        ai_status = "unverified"
+    else:
+        ai_status = "compatible"
+
+    return {
+        "record_count": count,
+        "compatibility_status": compatibility_status,
+        "compatible": compatibility_status == "compatible",
+        "compatibility_issues": compatibility_issues,
+        "execution_modes": execution_modes,
+        "config_fingerprints": config_fingerprints,
+        "missing_execution_mode": missing_execution_mode,
+        "missing_config_fingerprint": missing_config_fingerprint,
+        "unrecognized_execution_modes": unknown_execution_modes,
+        "ai": {
+            "record_count": len(ai_records),
+            "compatibility_status": ai_status,
+            "compatible": ai_status in {"compatible", "not_applicable"},
+            "compatibility_issues": ai_issues,
+            "response_models": ai_response_models,
+            "prompt_versions": ai_prompt_versions,
+            "missing_response_model": missing_ai_response_model,
+            "missing_prompt_version": missing_ai_prompt_version,
+        },
+    }
+
+
+def _counted_values(values: dict[str, int]) -> str:
+    return ", ".join(f"{value}={count}" for value, count in values.items())
+
+
+def provenance_warnings(provenance: dict[str, Any]) -> list[str]:
+    """Turn machine-readable provenance diagnostics into explicit warnings."""
+
+    count = provenance["record_count"]
+    if not count:
+        return []
+
+    warnings: list[str] = []
+    execution_modes = provenance["execution_modes"]
+    config_fingerprints = provenance["config_fingerprints"]
+    if len(execution_modes) > 1:
+        warnings.append(
+            "Compatibility warning: mixed execution modes across complete CLOSE "
+            f"records ({_counted_values(execution_modes)}); aggregated metrics "
+            "must not be treated as one comparable experiment."
+        )
+    if provenance["unrecognized_execution_modes"]:
+        warnings.append(
+            "Provenance warning: unrecognized execution mode(s) were retained: "
+            + ", ".join(provenance["unrecognized_execution_modes"])
+            + ". Compatibility is unverified."
+        )
+    if provenance["missing_execution_mode"]:
+        warnings.append(
+            "Provenance warning: "
+            f"{provenance['missing_execution_mode']} of {count} complete CLOSE "
+            "record(s) are missing or have invalid execution_mode metadata; "
+            "legacy P&L remains included, but execution-mode compatibility is "
+            "unverified."
+        )
+    if len(config_fingerprints) > 1:
+        warnings.append(
+            "Compatibility warning: mixed config fingerprints across complete "
+            f"CLOSE records ({_counted_values(config_fingerprints)}); aggregated "
+            "metrics combine different strategy/config experiments."
+        )
+    if provenance["missing_config_fingerprint"]:
+        warnings.append(
+            "Provenance warning: "
+            f"{provenance['missing_config_fingerprint']} of {count} complete CLOSE "
+            "record(s) are missing or have invalid config_fingerprint metadata; "
+            "legacy P&L remains included, but configuration compatibility is "
+            "unverified."
+        )
+
+    ai = provenance["ai"]
+    if len(ai["response_models"]) > 1:
+        warnings.append(
+            "AI provenance warning: mixed response models across AI-attributed "
+            f"records ({_counted_values(ai['response_models'])})."
+        )
+    if ai["missing_response_model"]:
+        warnings.append(
+            "AI provenance warning: "
+            f"{ai['missing_response_model']} of {ai['record_count']} AI-attributed "
+            "record(s) lack response-model metadata; AI cohort attribution is "
+            "unverified."
+        )
+    if len(ai["prompt_versions"]) > 1:
+        warnings.append(
+            "AI provenance warning: mixed prompt versions across AI-attributed "
+            f"records ({_counted_values(ai['prompt_versions'])})."
+        )
+    if ai["missing_prompt_version"]:
+        warnings.append(
+            "AI provenance warning: "
+            f"{ai['missing_prompt_version']} of {ai['record_count']} AI-attributed "
+            "record(s) lack prompt-version metadata; AI cohort attribution is "
+            "unverified."
+        )
+    return warnings
+
+
 def resolve_input_paths(raw_paths: Sequence[str | os.PathLike[str]] | None) -> tuple[list[Path], list[str]]:
     """Expand files, directories, and quoted glob patterns without duplication."""
 
@@ -277,8 +491,10 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
     """Build an overall report and explicit APPROVE/REJECT cohorts."""
 
     records, diagnostics = parse_trade_files(paths)
+    provenance = summarize_provenance(records)
     approve = [record for record in records if record.ai_decision == "APPROVE"]
     reject = [record for record in records if record.ai_decision == "REJECT"]
+    ai_errors = [record for record in records if record.ai_decision == "ERROR"]
 
     warnings: list[str] = []
     if diagnostics.incomplete_close_events:
@@ -293,15 +509,18 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
         warnings.append("One or more files could not be read; their records are absent.")
     if not records:
         warnings.append("No complete P&L CLOSE records were found; profitability is unknown.")
+    warnings.extend(provenance_warnings(provenance))
 
     return {
         "files": [str(path) for path in paths],
         "drawdown_order": "lexically sorted source path, then JSONL line number",
         "diagnostics": diagnostics.as_dict(),
+        "provenance": provenance,
         "summary": summarize_trades(records),
         "ai_shadow_cohorts": {
             "APPROVE": summarize_trades(approve),
             "REJECT": summarize_trades(reject),
+            "ERROR": summarize_trades(ai_errors),
         },
         "warnings": warnings,
     }
@@ -339,11 +558,23 @@ def format_text_report(report: dict[str, Any]) -> str:
     """Render a concise human-readable report."""
 
     diagnostics = report["diagnostics"]
+    provenance = report["provenance"]
+    ai_provenance = provenance["ai"]
     lines = [
         "Intraday bot performance report",
         f"Files: {len(report['files'])}",
         f"Complete CLOSE records: {diagnostics['complete_close_events']}",
         f"Incomplete/legacy CLOSE records excluded: {diagnostics['incomplete_close_events']}",
+        f"Provenance compatibility: {provenance['compatibility_status']}",
+        "Execution modes: "
+        + (_counted_values(provenance["execution_modes"]) or "none recorded"),
+        "Config fingerprints: "
+        + (_counted_values(provenance["config_fingerprints"]) or "none recorded"),
+        f"AI provenance compatibility: {ai_provenance['compatibility_status']}",
+        "AI response models: "
+        + (_counted_values(ai_provenance["response_models"]) or "none recorded"),
+        "AI prompt versions: "
+        + (_counted_values(ai_provenance["prompt_versions"]) or "none recorded"),
         "",
     ]
     lines.extend(_summary_lines("Overall", report["summary"]))
@@ -351,6 +582,8 @@ def format_text_report(report: dict[str, Any]) -> str:
     lines.extend(_summary_lines("AI APPROVE cohort", report["ai_shadow_cohorts"]["APPROVE"]))
     lines.append("")
     lines.extend(_summary_lines("AI REJECT shadow cohort", report["ai_shadow_cohorts"]["REJECT"]))
+    lines.append("")
+    lines.extend(_summary_lines("AI ERROR/unavailable cohort", report["ai_shadow_cohorts"]["ERROR"]))
 
     if diagnostics["incomplete_reasons"]:
         lines.extend(("", "Excluded CLOSE reasons:"))

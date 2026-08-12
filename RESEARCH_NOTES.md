@@ -16,8 +16,9 @@ The broad scan uses current WebSocket ticks, then one full-quote request for
 depth/circuit checks, and historical candles only for the shortlist. The setup
 engine drops the forming five-minute candle, warms EMA/RSI/ATR over earlier
 sessions, resets VWAP each session, and compares volume with earlier sessions'
-same clock-time bar. The signal is rechecked for age, current price, and
-breakout distance after a possibly slow AI review.
+same clock-time bar. Online `shadow`/`gate` review is synchronous. The signal is
+checked before it and then finally rechecked and rebuilt for age, price,
+breakout distance, cost, and capacity after the possibly slow review.
 
 These are sensible live-data causality controls, but they are not a backtest.
 They have not established that ORB/VWAP/EMA/RSI/RVOL has positive expectancy.
@@ -40,14 +41,19 @@ may still be rejected by exchange price-protection rules.
 
 ### AI is bounded and optional
 
-- `off` avoids the OpenAI call and records `OFF`.
-- `shadow` records a review but does not block deterministic paper execution.
-- `gate` requires approval/thresholds and treats an AI failure as rejection.
+- `off` avoids execution-loop OpenAI calls and records `OFF`; it is the
+  recommended baseline.
+- `shadow` does not use the label as a direct veto, but its synchronous latency
+  can cross the cutoff or change final revalidation. It is not execution-neutral.
+- `gate` requires approval/thresholds and fail-closes on a separate AI error;
+  it remains paper-research only.
 - AI never changes size, stops, or hard daily/position limits.
 
-The AI sees only supplied numerical features. It has no privileged future,
-news, order-book, or fill information. Its confidence is not a probability of
-profit.
+The online reviewer sees the supplied setup, including identifiers and
+categorical fields. The separate offline worker removes direct identifiers,
+timestamp, and composite scores, but its payload is only identifier-stripped,
+not guaranteed anonymous. Neither path has privileged future, news, order-book,
+or fill information. AI confidence is not a probability of profit.
 
 ## Remaining validation and measurement blockers
 
@@ -82,10 +88,18 @@ rescues a leaky or unrealistic simulation.
 
 ### 2. Journals are insufficient for reproducible profit attribution
 
-The journal does not snapshot a complete run manifest containing the code
-revision, all strategy/risk/cost parameters, universe version, data timestamp,
-and prompt/schema hash. Aggregating logs can therefore mix incompatible
-strategies and cost regimes.
+V3.2 journals a normalized run manifest and hashes `bot.py`, `trading_core.py`,
+the pinned requirements file, and material configuration. After final
+revalidation and trade rebuild it attempts to journal the final eligible
+candidate with a stable `idea_id`. That stream is cutoff- and capacity-truncated
+and is not the complete rejected-opportunity universe. Point-in-time
+universe/data versions, installed-runtime provenance, corporate actions, and an
+explicit exchange-session-rules version are still missing.
+
+The performance reporter keeps legacy P&L calculable but warns when execution
+mode or configuration fingerprints are mixed/missing, and when AI response
+model or prompt provenance is mixed/missing. Such output is incompatible or
+unverifiable evidence; the warning does not repair the aggregation.
 
 The report's drawdown is realized close-to-close rupee drawdown. It excludes
 intratrade/unrealized drawdown, overlapping capital, exposure, deposits, and
@@ -103,11 +117,14 @@ authoritative.
 
 ### 3. Current AI cohorts are not clean causal evidence
 
-In shadow mode, an unavailable API or model error becomes the same `REJECT`
-decision stored on `CLOSE` as a genuine model rejection. The report also does
-not retain `ai_mode`, prompt version, response model, response ID, latency, or
-error on each close, so APPROVE/REJECT cohorts can mix shadow and gate runs,
-models, prompts, and service failures.
+V3.2 separates local/API failure as `ERROR`. A successful online review records
+its input hash, decision ID, actual response model/ID, latency, basic token
+counts, and setup snapshot. Skipped, unavailable, or failed reviews retain a
+status/reason but may have blank provider metadata and zero usage. The report's
+`ERROR` cohort contains completed trades carrying that label; it is not a count
+of every failed review. Journal fields are provenance aids, not immutable proof.
+Cross-run causal reporting still needs experiment-isolated joins between
+`AI_CANDIDATE`, `AI_REVIEW`, and portfolio outcomes.
 
 Shadow execution is not an exact gate-policy counterfactual: the AI call delays
 entry/revalidation, and executing shadow-rejected trades consumes daily-trade
@@ -124,38 +141,39 @@ Official OpenAI guidance recommends task-specific, production-representative
 evals, logging, held-out data, human calibration, and continuous evaluation;
 it explicitly warns against “vibe-based” evaluation. See
 [OpenAI evaluation best practices](https://developers.openai.com/api/docs/guides/evaluation-best-practices).
-OpenAI also notes that model behavior can change between snapshots and
-recommends pinned model versions plus application evals; see
-[API backwards compatibility](https://developers.openai.com/api/reference/overview#backwards-compatibility).
-Treat every model, prompt, schema, or threshold change as a new strategy trial.
+The configured `gpt-5.6` name is an alias that currently routes to GPT-5.6 Sol,
+not a fixed behavioral snapshot. Pin an explicit snapshot when available,
+retain the actual response model, and treat alias drift or every model, prompt,
+schema, or threshold change as a new trial. See the official
+[GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
 
 ### 4. Risk and operational simulations remain incomplete
 
 - Paper daily-loss checking currently uses realized P&L, not portfolio
   mark-to-market P&L; its kill-switch behavior is therefore not a full live-risk
   simulation.
-- Maximum positions limits trade count, but there is no sector, correlation,
-  beta, gross/net exposure, or aggregate gap-risk control.
-- A connected WebSocket tick can be accepted up to the configured 180-second
-  age, while the full-quote response refreshes circuit calculations but not all
-  ranking fields. Record and enforce tighter feature freshness.
-- NIFTY regime selects the latest returned session without explicitly requiring
-  today's date. A transient data gap can silently use the previous session.
-- During a live session, an external partial position change is not continuously
-  checked against the protective stop's pending quantity. An oversized stop can
-  create reversal risk; reconciliation on restart is too late.
+- V3.2 reserves aggregate open-stop risk and gross exposure before entry, but
+  sector, correlation, beta, net-directional and aggregate gap-risk controls
+  remain absent.
+- The configured WebSocket age now defaults to 30 seconds and validation rejects
+  values over 60; the full-quote response still does not refresh every ranking
+  field.
+- NIFTY and setup data now explicitly require today's session.
+- Live monitoring now checks exact stop identity and pending quantity against
+  broker position quantity; account-wide fencing across another machine or
+  clone remains unresolved.
 
 These are live-money blockers, not optimization opportunities.
 
 ## Broker, sandbox, and regulatory boundaries
 
-Zerodha staff currently state that Kite Connect has
-[no sandbox environment](https://kite.trade/forum/discussion/15871/how-to-test-applications-before-putting-in-real-money).
-Recheck this before every readiness review because availability can change. A
-local simulator with injected timeouts, duplicated/out-of-order postbacks,
-partial fills, rejections, reconnects, restarts, and orphan orders is required,
-but it cannot certify real OMS/exchange behavior. Never treat intentionally
-rejected live orders or an underfunded account as a safe sandbox.
+Kite documents an official
+[no-real-money sandbox](https://kite.trade/docs/connect/v3/sandbox/). It supports
+LIMIT orders but omits MARKET, GTT, and margin-calculation behavior, so it cannot
+cover the complete production path. Retain a deterministic local simulator with
+injected timeouts, duplicated/out-of-order postbacks, partial fills, rejections,
+reconnects, restarts, and orphan orders; neither environment guarantees live OMS
+or exchange behavior.
 
 The NSE's
 [May 2025 retail-algo implementation standards](https://nsearchives.nseindia.com/content/circulars/INVG67858.pdf)
@@ -167,6 +185,15 @@ algo-order tagging. This project appears to fall in that self-hosted category,
 but only Zerodha/NSE can confirm account-specific implementation and current
 rules. Matching the configured IP through a public-IP service does not prove
 broker whitelisting or compliance.
+
+SEBI introduced a phased Closing Auction Session (CAS) for eligible equity-cash
+securities, and NSE Clearing states an effective date of 2026-08-03. The bot's
+15:10 forced exit is before CAS, but CAS changes closing-price construction and
+end-of-session data semantics. A recorder or replay must explicitly version the
+exchange-session regime and keep pre-CAS and post-CAS assumptions separate. See
+the [SEBI CAS circular](https://www.sebi.gov.in/legal/circulars/jan-2026/introduction-of-closing-auction-session-cas-in-the-equity-cash-segment-and-certain-modifications-in-the-pre-open-auction-session_99122.html)
+and
+[NSE Clearing circular NCL/CMPT/74898](https://nsearchives.nseindia.com/content/circulars/CMPT74898.pdf).
 
 ## Minimum evidence before any live canary
 
@@ -181,7 +208,8 @@ broker whitelisting or compliance.
    the blockers above, and complete sustained forward paper observation.
 6. Reconfirm current broker/exchange rules, static-IP mapping, charges, alerting,
    manual kill procedures, and independent broker-state reconciliation.
-7. Require explicit human approval and the smallest practical supervised
-   canary. Promotion must never be automatic.
+7. Require a separate legal, broker, operational, and human approval before even
+   considering the smallest supervised canary. This audit grants no live-trading
+   approval, and promotion must never be automatic.
 
 Even after all seven steps, losses remain possible and profit is not assured.

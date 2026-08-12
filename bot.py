@@ -52,7 +52,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,8 @@ from trading_core import (
     estimate_nse_equity_intraday_cost,
     gross_pnl,
     load_json_strict,
+    strict_finite_float,
+    strict_integral,
 )
 
 
@@ -101,8 +103,12 @@ OPENAI_REASONING_EFFORT = os.getenv(
     "OPENAI_REASONING_EFFORT",
     "low",
 ).strip().lower()
-AI_MODE = os.getenv("AI_MODE", "shadow").strip().lower()
-AI_PROMPT_VERSION = "nse-orb-review-v2"
+AI_MODE = os.getenv("AI_MODE", "off").strip().lower()
+AI_IDEA_MODE = os.getenv("AI_IDEA_MODE", "shadow").strip().lower()
+AI_IDEA_MAX_CANDIDATES = int(os.getenv("AI_IDEA_MAX_CANDIDATES", "8"))
+MAX_AI_REVIEWS_PER_SCAN = int(os.getenv("MAX_AI_REVIEWS_PER_SCAN", "3"))
+AI_PROMPT_VERSION = "nse-orb-review-v3"
+AI_IDEA_PROMPT_VERSION = "nse-candidate-ideas-v1"
 
 # Safety switch
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -110,6 +116,7 @@ LIVE_TRADING_CONFIRM = os.getenv(
     "LIVE_TRADING_CONFIRM",
     "",
 ).strip()
+EXECUTION_MODE = "live" if LIVE_TRADING else "paper"
 
 # Capital/risk
 CAPITAL_LIMIT = float(os.getenv("CAPITAL_LIMIT", "100000"))
@@ -118,6 +125,12 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.008"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+MAX_PORTFOLIO_STOP_RISK_PCT = float(
+    os.getenv("MAX_PORTFOLIO_STOP_RISK_PCT", "0.004")
+)
+MAX_GROSS_EXPOSURE_PCT = float(
+    os.getenv("MAX_GROSS_EXPOSURE_PCT", "0.50")
+)
 
 # Candidate selection
 PRELIMINARY_POOL_SIZE = int(os.getenv("PRELIMINARY_POOL_SIZE", "100"))
@@ -149,6 +162,10 @@ MAX_BREAKOUT_DISTANCE_ATR = float(
 # Trade construction
 ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.20"))
 TARGET_R_MULTIPLE = float(os.getenv("TARGET_R_MULTIPLE", "1.80"))
+MIN_AFTER_COST_PAYOFF_RATIO = float(
+    os.getenv("MIN_AFTER_COST_PAYOFF_RATIO", "1.20")
+)
+CIRCUIT_HEADROOM_BPS = float(os.getenv("CIRCUIT_HEADROOM_BPS", "10"))
 
 # Execution safety. Signals are revalidated after the bounded AI review.
 MAX_SIGNAL_AGE_SECONDS = int(
@@ -189,6 +206,9 @@ FULL_SCAN_EVERY_SECONDS = int(os.getenv("FULL_SCAN_EVERY_SECONDS", "180"))
 POSITION_MONITOR_EVERY_SECONDS = int(
     os.getenv("POSITION_MONITOR_EVERY_SECONDS", "5")
 )
+ENTRY_CUTOFF_GUARD_SECONDS = int(
+    os.getenv("ENTRY_CUTOFF_GUARD_SECONDS", "10")
+)
 
 # REST rate safety
 # Kite historical API = 3 req/sec. Stay slightly below it.
@@ -227,37 +247,105 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.1-hardened-20260811"
-CODE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+STRATEGY_VERSION = "3.2-paper-research-20260811"
+SOURCE_SHA256 = {
+    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in (
+        Path(__file__),
+        BASE_DIR / "trading_core.py",
+        BASE_DIR / "requirements.txt",
+    )
+}
+CODE_SHA256 = SOURCE_SHA256[Path(__file__).name]
+
+# This manifest deliberately excludes credentials while including every
+# setting that can materially change selection, sizing, execution or AI
+# attribution.  It is journalled at session start and hashed into active state.
+RUNTIME_MANIFEST: dict[str, Any] = {
+    "strategy_version": STRATEGY_VERSION,
+    "source_sha256": SOURCE_SHA256,
+    "execution_mode": EXECUTION_MODE,
+    "ai": {
+        "mode": AI_MODE,
+        "idea_mode": AI_IDEA_MODE,
+        "model": OPENAI_MODEL,
+        "prompt_version": AI_PROMPT_VERSION,
+        "idea_prompt_version": AI_IDEA_PROMPT_VERSION,
+        "reasoning_effort": OPENAI_REASONING_EFFORT,
+        "timeout_seconds": OPENAI_TIMEOUT_SECONDS,
+        "max_retries": OPENAI_MAX_RETRIES,
+        "min_confidence": AI_MIN_CONFIDENCE,
+        "max_reviews_per_scan": MAX_AI_REVIEWS_PER_SCAN,
+        "idea_max_candidates": AI_IDEA_MAX_CANDIDATES,
+    },
+    "risk": {
+        "capital_limit": CAPITAL_LIMIT,
+        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+        "max_position_pct": MAX_POSITION_PCT,
+        "max_daily_loss_pct": MAX_DAILY_LOSS_PCT,
+        "max_portfolio_stop_risk_pct": MAX_PORTFOLIO_STOP_RISK_PCT,
+        "max_gross_exposure_pct": MAX_GROSS_EXPOSURE_PCT,
+        "max_trades": MAX_TRADES_PER_DAY,
+        "max_positions": MAX_OPEN_POSITIONS,
+        "max_consecutive_losses": MAX_CONSECUTIVE_LOSSES,
+    },
+    "selection": {
+        "preliminary_pool_size": PRELIMINARY_POOL_SIZE,
+        "candidate_pool_size": CANDIDATE_POOL_SIZE,
+        "technical_min_score": TECH_MIN_SCORE,
+        "price": [MIN_PRICE, MAX_PRICE],
+        "spread_bps": MAX_SPREAD_BPS,
+        "abs_change_pct": [MIN_ABS_CHANGE_PCT, MAX_ABS_CHANGE_PCT],
+        "min_day_range_pct": MIN_DAY_RANGE_PCT,
+        "min_circuit_buffer_pct": MIN_CIRCUIT_BUFFER_PCT,
+        "max_gap_pct": MAX_GAP_PCT,
+    },
+    "setup": {
+        "min_rvol": MIN_RVOL,
+        "atr_pct": [MIN_ATR_PCT, MAX_ATR_PCT],
+        "max_vwap_distance_atr": MAX_VWAP_DISTANCE_ATR,
+        "breakout_atr": [
+            MIN_BREAKOUT_DISTANCE_ATR,
+            MAX_BREAKOUT_DISTANCE_ATR,
+        ],
+        "stop_atr": ATR_STOP_MULTIPLIER,
+        "target_r": TARGET_R_MULTIPLE,
+        "min_after_cost_payoff_ratio": MIN_AFTER_COST_PAYOFF_RATIO,
+        "circuit_headroom_bps": CIRCUIT_HEADROOM_BPS,
+    },
+    "execution": {
+        "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
+        "max_entry_drift_atr": MAX_ENTRY_DRIFT_ATR,
+        "entry_fill_timeout_seconds": ENTRY_FILL_TIMEOUT_SECONDS,
+        "stop_arm_timeout_seconds": STOP_ARM_TIMEOUT_SECONDS,
+        "exit_fill_timeout_seconds": EXIT_FILL_TIMEOUT_SECONDS,
+        "order_poll_seconds": ORDER_POLL_SECONDS,
+        "paper_slippage_bps": PAPER_SLIPPAGE_BPS,
+        "risk_slippage_bps": RISK_SLIPPAGE_BPS,
+        "max_exit_attempts": MAX_EXIT_ATTEMPTS,
+    },
+    "schedule": {
+        "market_open": MARKET_OPEN.isoformat(),
+        "signal_start": SIGNAL_START.isoformat(),
+        "last_entry": LAST_ENTRY.isoformat(),
+        "force_exit": FORCE_EXIT.isoformat(),
+        "session_end": SESSION_END.isoformat(),
+        "entry_cutoff_guard_seconds": ENTRY_CUTOFF_GUARD_SECONDS,
+        "full_scan_every_seconds": FULL_SCAN_EVERY_SECONDS,
+        "position_monitor_every_seconds": POSITION_MONITOR_EVERY_SECONDS,
+    },
+    "data": {
+        "candle_delay_seconds": CANDLE_DELAY_SECONDS,
+        "indicator_lookback_days": INDICATOR_LOOKBACK_DAYS,
+        "ws_instruments_per_connection": WS_MAX_INSTRUMENTS_PER_CONNECTION,
+        "ws_active_tick_max_age_seconds": WS_ACTIVE_TICK_MAX_AGE_SECONDS,
+        "ws_warmup_seconds": WS_WARMUP_SECONDS,
+        "max_ws_disconnect_seconds": MAX_WS_DISCONNECT_SECONDS,
+    },
+}
 RUNTIME_CONFIG_FINGERPRINT = hashlib.sha256(
     json.dumps(
-        {
-            "strategy_version": STRATEGY_VERSION,
-            "code_sha256": CODE_SHA256,
-            "ai_mode": AI_MODE,
-            "openai_model": OPENAI_MODEL,
-            "ai_prompt_version": AI_PROMPT_VERSION,
-            "capital_limit": CAPITAL_LIMIT,
-            "risk_per_trade_pct": RISK_PER_TRADE_PCT,
-            "max_position_pct": MAX_POSITION_PCT,
-            "max_daily_loss_pct": MAX_DAILY_LOSS_PCT,
-            "max_trades": MAX_TRADES_PER_DAY,
-            "max_positions": MAX_OPEN_POSITIONS,
-            "tech_min_score": TECH_MIN_SCORE,
-            "filters": {
-                "min_rvol": MIN_RVOL,
-                "atr": [MIN_ATR_PCT, MAX_ATR_PCT],
-                "spread_bps": MAX_SPREAD_BPS,
-                "breakout_atr": [
-                    MIN_BREAKOUT_DISTANCE_ATR,
-                    MAX_BREAKOUT_DISTANCE_ATR,
-                ],
-            },
-            "stop_atr": ATR_STOP_MULTIPLIER,
-            "target_r": TARGET_R_MULTIPLE,
-            "paper_slippage_bps": PAPER_SLIPPAGE_BPS,
-            "risk_slippage_bps": RISK_SLIPPAGE_BPS,
-        },
+        RUNTIME_MANIFEST,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -292,6 +380,8 @@ class Quote:
     day_range_pct: float
     gap_pct: float
     circuit_buffer_pct: float
+    lower_circuit_limit: float = 0.0
+    upper_circuit_limit: float = 0.0
     stock_in_play_score: float = 0.0
 
 
@@ -330,6 +420,8 @@ class Setup:
 
     technical_score: float
     signal_at: str
+    lower_circuit_limit: float = 0.0
+    upper_circuit_limit: float = 0.0
 
 
 @dataclass
@@ -371,6 +463,13 @@ class Trade:
     net_pnl: float = 0.0
     r_multiple: float = 0.0
     planned_risk_amount: float = 0.0
+    reserved_risk_amount: float = 0.0
+    reserved_notional_amount: float = 0.0
+    planned_target_profit_amount: float = 0.0
+    planned_after_cost_payoff: float = 0.0
+    execution_mode: str = ""
+    idea_id: str = ""
+    ai_review_idea_id: str = ""
     ai_decision: str = ""
     ai_mode: str = ""
     ai_valid: bool = False
@@ -378,16 +477,64 @@ class Trade:
     ai_response_model: str = ""
     ai_response_id: str = ""
     ai_prompt_version: str = ""
+    ai_decision_id: str = ""
+    ai_input_sha256: str = ""
+    ai_input_tokens: int = 0
+    ai_output_tokens: int = 0
+    ai_total_tokens: int = 0
     accounting_uncertain: bool = False
     accounting_note: str = ""
 
 
 class AIDecision(BaseModel):
-    decision: Literal["APPROVE", "REJECT"]
+    decision: Literal["APPROVE", "REJECT", "ERROR"]
     confidence: int = Field(ge=0, le=100)
     quality_score: int = Field(ge=0, le=100)
     reason: str
     risk_flags: list[str]
+
+
+@dataclass(frozen=True)
+class ExecutionSnapshot:
+    ltp: float
+    best_bid: float
+    best_ask: float
+    spread_bps: float
+    lower_circuit: float
+    upper_circuit: float
+    observed_at: str
+
+
+@dataclass(frozen=True)
+class AfterCostOutcome:
+    entry_fill: float
+    stop_reference: float
+    target_reference: float
+    stop_fill: float
+    target_fill: float
+    stop_loss: float
+    target_profit: float
+    payoff_ratio: float
+
+
+@dataclass(frozen=True)
+class EntryCapacity:
+    open_reserved_risk: float
+    open_gross_notional: float
+    daily_risk_remaining: float
+    portfolio_risk_remaining: float
+    gross_notional_remaining: float
+    candidate_risk_budget: float
+    candidate_notional_budget: float
+    allowed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class TradeBuildResult:
+    trade: Trade | None
+    reason: str
+    outcome: AfterCostOutcome | None = None
 
 
 # =============================================================================
@@ -396,6 +543,10 @@ class AIDecision(BaseModel):
 
 def now_ist() -> datetime:
     return pd.Timestamp.now(tz=IST).to_pydatetime()
+
+
+def current_execution_mode() -> str:
+    return "live" if LIVE_TRADING else "paper"
 
 
 def log(message: str) -> None:
@@ -415,14 +566,179 @@ def safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def stable_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_ai_candidate_payload(
+    setup: Setup,
+    trade: Trade,
+    capacity: EntryCapacity,
+) -> dict[str, Any]:
+    observed = now_ist()
+    signal_at = datetime.fromisoformat(setup.signal_at)
+    if signal_at.tzinfo is None:
+        signal_at = pd.Timestamp(signal_at, tz=IST).to_pydatetime()
+    market_open = datetime.combine(
+        observed.date(),
+        MARKET_OPEN,
+        tzinfo=observed.tzinfo,
+    )
+    return {
+        "setup": asdict(setup),
+        "context": {
+            "minutes_since_open": max(
+                0.0,
+                (observed - market_open).total_seconds() / 60,
+            ),
+            "signal_age_seconds": max(
+                0.0,
+                (observed - signal_at).total_seconds(),
+            ),
+        },
+        "economics": {
+            "entry": trade.entry_price,
+            "stop": trade.stop_price,
+            "target": trade.target_price,
+            "qty": trade.qty,
+            "planned_risk": trade.planned_risk_amount,
+            "reserved_notional": trade.reserved_notional_amount,
+            "planned_target_profit": trade.planned_target_profit_amount,
+            "after_cost_payoff": trade.planned_after_cost_payoff,
+        },
+        "capacity": asdict(capacity),
+        "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
+    }
+
+
+def identifier_stripped_ai_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Remove identity/time/composite scores from an online model request."""
+    setup = dict(candidate["setup"])
+    for key in (
+        "symbol",
+        "token",
+        "signal_at",
+        "technical_score",
+        "stock_in_play_score",
+    ):
+        setup.pop(key, None)
+    return {
+        "setup": setup,
+        "context": candidate["context"],
+        "economics": candidate["economics"],
+    }
+
+
 def chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
 
+def parse_mis_position_quantities(rows: Any) -> dict[str, int]:
+    """Normalize authoritative NSE/MIS positions without synthetic zeros."""
+    if not isinstance(rows, list):
+        raise RuntimeError("broker positions payload must be a list")
+    quantities: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"broker position row {index} is not an object")
+        exchange = str(row.get("exchange") or "").strip().upper()
+        product = str(row.get("product") or "").strip().upper()
+        if exchange != "NSE" or product != "MIS":
+            continue
+        symbol = str(row.get("tradingsymbol") or "").strip().upper()
+        if not symbol:
+            raise RuntimeError(f"broker NSE/MIS position row {index} has no symbol")
+        if symbol in quantities:
+            raise RuntimeError(f"duplicate NSE/MIS position row for {symbol}")
+        try:
+            quantities[symbol] = strict_integral(
+                row.get("quantity"),
+                field=f"position[{symbol}].quantity",
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    return quantities
+
+
+def broker_mis_position_quantities(broker: Any) -> dict[str, int]:
+    method = getattr(broker, "mis_position_quantities", None)
+    if method is not None:
+        result = method()
+        if not isinstance(result, dict):
+            raise RuntimeError("broker MIS position map is invalid")
+        return {
+            str(symbol).upper(): strict_integral(
+                quantity,
+                field=f"position[{symbol}].quantity",
+            )
+            for symbol, quantity in result.items()
+        }
+    return parse_mis_position_quantities(broker.positions())
+
+
+def verify_live_account_matches_state(broker: Any, state: dict) -> None:
+    """Fail closed when live NSE/MIS exposure is not exclusively state-owned."""
+    actual = {
+        symbol: quantity
+        for symbol, quantity in broker_mis_position_quantities(broker).items()
+        if quantity != 0
+    }
+    expected: dict[str, int] = {}
+    for symbol, record in state.get("trades", {}).items():
+        if not isinstance(record, dict):
+            raise RuntimeError(f"invalid active trade record for {symbol}")
+        status = str(record.get("status", "")).upper()
+        if status not in ACTIVE_TRADE_STATUSES and not status.startswith("OPEN"):
+            continue
+        trade = trade_from_dict(record)
+        if status != "OPEN_PROTECTED":
+            raise RuntimeError(
+                f"unreconciled {trade.symbol} lifecycle state {status}"
+            )
+        if trade.qty <= 0:
+            raise RuntimeError(f"invalid active quantity for {trade.symbol}")
+        signed_quantity = trade.qty if trade.side == "LONG" else -trade.qty
+        normalized_symbol = trade.symbol.upper()
+        if normalized_symbol in expected:
+            raise RuntimeError(f"duplicate active trade for {normalized_symbol}")
+        expected[normalized_symbol] = signed_quantity
+    if actual != expected:
+        raise RuntimeError(
+            "broker NSE/MIS positions do not match durable active state: "
+            f"expected={expected}, actual={actual}"
+        )
+
+
 def round_to_tick(price: float, tick_size: float) -> float:
     tick_size = tick_size if tick_size > 0 else 0.05
     return round(round(price / tick_size) * tick_size, 2)
+
+
+def entry_deadline(value: datetime) -> datetime:
+    cutoff = datetime.combine(
+        value.date(),
+        LAST_ENTRY,
+        tzinfo=value.tzinfo,
+    )
+    return cutoff - timedelta(seconds=ENTRY_CUTOFF_GUARD_SECONDS)
+
+
+def entry_window_open(value: datetime | None = None) -> bool:
+    observed = value or now_ist()
+    start = datetime.combine(
+        observed.date(),
+        SIGNAL_START,
+        tzinfo=observed.tzinfo,
+    )
+    return start <= observed < entry_deadline(observed)
 
 
 def new_order_tag(role: str) -> str:
@@ -440,10 +756,48 @@ def is_generated_order_tag(tag: str) -> bool:
     )
 
 
+def allowed_broker_order_types(requested_order_type: str) -> frozenset[str]:
+    """Return documented effective types for protected Kite order intents."""
+    requested = str(requested_order_type or "").strip().upper()
+    if requested == "MARKET":
+        # Kite market protection represents the exchange mutation as bounded
+        # limit behaviour; recovery must accept either broker representation.
+        return frozenset({"MARKET", "LIMIT"})
+    if requested in {"SL-M", "SLM"}:
+        # A protected stop may be represented as SL-M while armed and as a
+        # MARKET/LIMIT order after trigger or explicit conversion.
+        return frozenset({"SL-M", "SLM", "MARKET", "LIMIT"})
+    return frozenset({requested}) if requested else frozenset()
+
+
 def trade_from_dict(data: dict) -> Trade:
     """Load current or legacy persisted trade data without accepting junk."""
     allowed = {field.name for field in fields(Trade)}
     return Trade(**{key: value for key, value in data.items() if key in allowed})
+
+
+def infer_trade_execution_mode(data: dict) -> str | None:
+    explicit = str(data.get("execution_mode") or "").strip().lower()
+    order_ids = [
+        data.get("entry_order_id"),
+        data.get("stop_order_id"),
+        data.get("exit_order_id"),
+        *(data.get("exit_order_ids") or []),
+    ]
+    concrete = [str(value) for value in order_ids if value]
+    derived: str | None = None
+    if concrete:
+        dry = [value.startswith("DRY-") for value in concrete]
+        if any(dry) and not all(dry):
+            raise RuntimeError("trade mixes DRY and real broker order identities")
+        derived = "paper" if all(dry) else "live"
+    if explicit and explicit not in {"paper", "live"}:
+        raise RuntimeError("trade execution mode is invalid")
+    if explicit and derived and explicit != derived:
+        raise RuntimeError(
+            f"trade is labelled {explicit} but its order IDs are {derived}"
+        )
+    return explicit or derived
 
 
 ACTIVE_TRADE_STATUSES = {
@@ -463,8 +817,14 @@ def validate_configuration() -> None:
 
     if AI_MODE not in {"off", "shadow", "gate"}:
         errors.append("AI_MODE must be off, shadow, or gate")
+    if AI_IDEA_MODE not in {"off", "shadow"}:
+        errors.append("AI_IDEA_MODE must be off or shadow")
     if AI_MODE == "gate" and not OPENAI_API_KEY:
         errors.append("AI_MODE=gate requires OPENAI_API_KEY")
+    if not 1 <= AI_IDEA_MAX_CANDIDATES <= 25:
+        errors.append("AI_IDEA_MAX_CANDIDATES must be between 1 and 25")
+    if not 1 <= MAX_AI_REVIEWS_PER_SCAN <= 10:
+        errors.append("MAX_AI_REVIEWS_PER_SCAN must be between 1 and 10")
 
     if OPENAI_REASONING_EFFORT not in {
         "none", "low", "medium", "high", "xhigh", "max"
@@ -482,6 +842,8 @@ def validate_configuration() -> None:
             "Live mode requires an explicit AI_MODE=off or AI_MODE=gate; "
             "shadow is a research default"
         )
+    if LIVE_TRADING and AI_IDEA_MODE != "off":
+        errors.append("AI idea generation is research-only in live mode")
 
     if not 0 < RISK_PER_TRADE_PCT <= 0.02:
         errors.append("RISK_PER_TRADE_PCT must be in (0, 0.02]")
@@ -489,9 +851,16 @@ def validate_configuration() -> None:
         errors.append("MAX_DAILY_LOSS_PCT must be in (0, 0.05]")
     if not 0 < MAX_POSITION_PCT <= 1:
         errors.append("MAX_POSITION_PCT must be in (0, 1]")
+    if not 0 < MAX_PORTFOLIO_STOP_RISK_PCT <= MAX_DAILY_LOSS_PCT:
+        errors.append(
+            "MAX_PORTFOLIO_STOP_RISK_PCT must be positive and no greater "
+            "than MAX_DAILY_LOSS_PCT"
+        )
+    if not 0 < MAX_GROSS_EXPOSURE_PCT <= 1:
+        errors.append("MAX_GROSS_EXPOSURE_PCT must be in (0, 1]")
     if MAX_OPEN_POSITIONS < 1 or MAX_TRADES_PER_DAY < 1:
         errors.append("position/trade limits must be positive")
-    if PRELIMINARY_POOL_SIZE > 500:
+    if PRELIMINARY_POOL_SIZE > 250:
         errors.append("PRELIMINARY_POOL_SIZE exceeds Kite /quote capacity")
     if not 1 <= CANDIDATE_POOL_SIZE <= PRELIMINARY_POOL_SIZE:
         errors.append("CANDIDATE_POOL_SIZE must fit the preliminary pool")
@@ -503,6 +872,10 @@ def validate_configuration() -> None:
         errors.append("ATR bounds are invalid")
     if not 0 < TARGET_R_MULTIPLE <= 10:
         errors.append("TARGET_R_MULTIPLE must be in (0, 10]")
+    if not 0 < MIN_AFTER_COST_PAYOFF_RATIO <= 10:
+        errors.append("MIN_AFTER_COST_PAYOFF_RATIO must be in (0, 10]")
+    if not 0 <= CIRCUIT_HEADROOM_BPS <= 1000:
+        errors.append("CIRCUIT_HEADROOM_BPS must be between 0 and 1000")
     if MAX_SIGNAL_AGE_SECONDS <= 0 or MAX_ENTRY_DRIFT_ATR <= 0:
         errors.append("signal freshness limits must be positive")
     if min(
@@ -513,10 +886,14 @@ def validate_configuration() -> None:
         OPENAI_TIMEOUT_SECONDS,
     ) <= 0:
         errors.append("timeouts and polling intervals must be positive")
-    if PAPER_SLIPPAGE_BPS < 0:
-        errors.append("PAPER_SLIPPAGE_BPS cannot be negative")
+    if not 0 <= PAPER_SLIPPAGE_BPS <= 100:
+        errors.append("PAPER_SLIPPAGE_BPS must be between 0 and 100")
     if not 0 <= RISK_SLIPPAGE_BPS <= 100:
         errors.append("RISK_SLIPPAGE_BPS must be between 0 and 100")
+    if RISK_SLIPPAGE_BPS < PAPER_SLIPPAGE_BPS:
+        errors.append(
+            "RISK_SLIPPAGE_BPS must be at least PAPER_SLIPPAGE_BPS"
+        )
     if MAX_CONSECUTIVE_LOSSES < 1 or MAX_EXIT_ATTEMPTS < 1:
         errors.append("loss and exit-attempt limits must be positive")
     if not 1 <= WS_ACTIVE_TICK_MAX_AGE_SECONDS <= 60:
@@ -525,12 +902,18 @@ def validate_configuration() -> None:
         errors.append("MAX_WS_DISCONNECT_SECONDS must be positive")
     if INDICATOR_LOOKBACK_DAYS < 7:
         errors.append("INDICATOR_LOOKBACK_DAYS must be at least 7")
+    if not 0 <= ENTRY_CUTOFF_GUARD_SECONDS < 300:
+        errors.append("ENTRY_CUTOFF_GUARD_SECONDS must be in [0, 300)")
 
     finite_values = {
         "CAPITAL_LIMIT": CAPITAL_LIMIT,
         "RISK_PER_TRADE_PCT": RISK_PER_TRADE_PCT,
         "MAX_POSITION_PCT": MAX_POSITION_PCT,
         "MAX_DAILY_LOSS_PCT": MAX_DAILY_LOSS_PCT,
+        "MAX_PORTFOLIO_STOP_RISK_PCT": MAX_PORTFOLIO_STOP_RISK_PCT,
+        "MAX_GROSS_EXPOSURE_PCT": MAX_GROSS_EXPOSURE_PCT,
+        "MIN_AFTER_COST_PAYOFF_RATIO": MIN_AFTER_COST_PAYOFF_RATIO,
+        "CIRCUIT_HEADROOM_BPS": CIRCUIT_HEADROOM_BPS,
         "PAPER_SLIPPAGE_BPS": PAPER_SLIPPAGE_BPS,
         "RISK_SLIPPAGE_BPS": RISK_SLIPPAGE_BPS,
     }
@@ -558,6 +941,9 @@ def dynamic_min_turnover_crore() -> float:
     return max(2.0, min(15.0, elapsed_min * 0.04))
 
 
+_JOURNAL_LOCK = threading.Lock()
+
+
 def journal(event: str, **fields) -> None:
     """
     JSONL avoids the changing-column problem that CSV journals get when OPEN,
@@ -570,12 +956,37 @@ def journal(event: str, **fields) -> None:
         "strategy_version": STRATEGY_VERSION,
         "code_sha256": CODE_SHA256,
         "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
+        "execution_mode": current_execution_mode(),
         **fields,
     }
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    encoded = json.dumps(
+        payload,
+        default=str,
+        allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+    with _JOURNAL_LOCK:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                fd = -1
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+
+def journal_best_effort(event: str, **fields) -> bool:
+    """Record telemetry without allowing it to block a safety action."""
+    try:
+        journal(event, **fields)
+        return True
+    except Exception as exc:
+        log(f"JOURNAL FAILURE for {event}: {type(exc).__name__}: {exc}")
+        return False
 
 
 # =============================================================================
@@ -584,8 +995,9 @@ def journal(event: str, **fields) -> None:
 
 def fresh_state() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "date": str(now_ist().date()),
+        "execution_mode": current_execution_mode(),
         "trades_today": 0,
         "blocked_symbols": [],
         "trades": {},
@@ -610,30 +1022,62 @@ def load_state() -> dict:
             "Refusing to start; restore or reconcile it manually."
         ) from exc
 
-    if state.get("date") != str(now_ist().date()):
-        return fresh_state()
-
-    stored_fingerprint = state.get("config_fingerprint")
+    raw_trades = state.get("trades")
+    trade_records = raw_trades if isinstance(raw_trades, dict) else {}
     has_active_state = any(
         str(record.get("status", "")).upper() in ACTIVE_TRADE_STATUSES
         or str(record.get("status", "")).upper().startswith("OPEN")
-        for record in state.get("trades", {}).values()
+        for record in trade_records.values()
         if isinstance(record, dict)
     )
-    if (
-        LIVE_TRADING
-        and has_active_state
-        and stored_fingerprint != RUNTIME_CONFIG_FINGERPRINT
-    ):
-        raise RuntimeError(
-            "Code/config fingerprint changed while active state exists; "
-            "manual broker reconciliation is required."
-        )
+    if state.get("date") != str(now_ist().date()):
+        if has_active_state:
+            raise RuntimeError(
+                "Previous-date active state exists; refusing to discard possible "
+                "broker exposure. Manual reconciliation is required."
+            )
+        return fresh_state()
+
+    stored_fingerprint = state.get("config_fingerprint")
+    stored_mode = str(state.get("execution_mode") or "").strip().lower()
+    inferred_modes = {
+        mode
+        for record in trade_records.values()
+        if isinstance(record, dict)
+        and str(record.get("status", "")).upper() in ACTIVE_TRADE_STATUSES
+        for mode in [infer_trade_execution_mode(record)]
+        if mode
+    }
+    if len(inferred_modes) > 1:
+        raise RuntimeError("Active state mixes live and paper order identities.")
+    inferred_mode = next(iter(inferred_modes), None)
+    if stored_mode not in {"paper", "live"}:
+        stored_mode = inferred_mode or ""
+    if has_active_state:
+        if not stored_mode:
+            raise RuntimeError(
+                "Active legacy state has ambiguous execution mode; manual "
+                "reconciliation is required."
+            )
+        if inferred_mode and inferred_mode != stored_mode:
+            raise RuntimeError("Active state execution-mode identity is inconsistent.")
+        if stored_mode != current_execution_mode():
+            raise RuntimeError(
+                f"Active {stored_mode} state cannot start in "
+                f"{current_execution_mode()} mode; "
+                "manual broker reconciliation is required."
+            )
+        if stored_fingerprint != RUNTIME_CONFIG_FINGERPRINT:
+            raise RuntimeError(
+                "Code/config fingerprint changed while active state exists; "
+                "manual broker reconciliation is required."
+            )
 
     defaults = fresh_state()
     for key, value in defaults.items():
         state.setdefault(key, value)
-    state["schema_version"] = 2
+    state["schema_version"] = 3
+    state["execution_mode"] = current_execution_mode()
     state["config_fingerprint"] = RUNTIME_CONFIG_FINGERPRINT
 
     if not isinstance(state.get("trades"), dict):
@@ -669,6 +1113,18 @@ def load_state() -> dict:
             raise RuntimeError(f"Invalid persisted trade for {symbol}.") from exc
         if trade.symbol != symbol or trade.side not in {"LONG", "SHORT"}:
             raise RuntimeError(f"Persisted trade identity is invalid for {symbol}.")
+        trade_mode = trade.execution_mode or infer_trade_execution_mode(record)
+        if not trade_mode:
+            trade_mode = state["execution_mode"]
+        if trade_mode not in {"paper", "live"}:
+            raise RuntimeError(f"Persisted {symbol} execution mode is invalid.")
+        if str(trade.status).upper() in ACTIVE_TRADE_STATUSES and (
+            trade_mode != state["execution_mode"]
+        ):
+            raise RuntimeError(f"Persisted {symbol} execution mode changed.")
+        if trade.execution_mode != trade_mode:
+            trade.execution_mode = trade_mode
+            state["trades"][symbol] = asdict(trade)
         for key, value in {
             "qty": trade.qty,
             "requested_qty": trade.requested_qty,
@@ -687,6 +1143,10 @@ def load_state() -> dict:
             "stop_price": trade.stop_price,
             "target_price": trade.target_price,
             "planned_risk_amount": trade.planned_risk_amount,
+            "reserved_risk_amount": trade.reserved_risk_amount,
+            "reserved_notional_amount": trade.reserved_notional_amount,
+            "planned_target_profit_amount": trade.planned_target_profit_amount,
+            "planned_after_cost_payoff": trade.planned_after_cost_payoff,
         }.items():
             if (
                 isinstance(value, bool)
@@ -1209,6 +1669,14 @@ class KiteBroker:
                     )
                 elif snapshot.terminal:
                     should_update = True
+                elif (
+                    snapshot.filled == current.filled
+                    and current.order_type in {"LIMIT", "MARKET"}
+                    and snapshot.order_type in {"SL-M", "SLM"}
+                ):
+                    # A delayed pre-conversion stop postback must not regress a
+                    # protected SL-M already represented as MARKET/LIMIT.
+                    should_update = False
                 else:
                     should_update = snapshot.filled >= current.filled
 
@@ -1317,7 +1785,8 @@ class KiteBroker:
             for q in quotes
         ]
 
-        # PRELIMINARY_POOL_SIZE is intentionally << 500,
+        # PRELIMINARY_POOL_SIZE is intentionally below the current 250-key
+        # full-quote request limit,
         # so this is one REST /quote request per market scan.
         response = self._rate_limited_quote(keys)
 
@@ -1412,6 +1881,8 @@ class KiteBroker:
 
             q.spread_bps = spread_bps
             q.circuit_buffer_pct = circuit_buffer
+            q.lower_circuit_limit = lower
+            q.upper_circuit_limit = upper
 
             enriched.append(q)
 
@@ -1428,8 +1899,8 @@ class KiteBroker:
             finally:
                 self._last_quote_request_at = time.monotonic()
 
-    def execution_snapshot(self, symbol: str) -> tuple[float, float, float]:
-        """Refresh LTP, spread and two-sided circuit buffer before entry."""
+    def execution_snapshot(self, symbol: str) -> ExecutionSnapshot:
+        """Refresh price, depth and both directional circuit limits."""
         key = f"NSE:{symbol}"
         data = self._rate_limited_quote([key]).get(key) or {}
         ltp = safe_float(data.get("last_price"))
@@ -1445,11 +1916,15 @@ class KiteBroker:
         lower = safe_float(data.get("lower_circuit_limit"))
         if not upper > ltp > lower > 0:
             raise RuntimeError("missing or invalid circuit limits")
-        circuit_buffer = min(
-            (upper - ltp) / ltp * 100,
-            (ltp - lower) / ltp * 100,
+        return ExecutionSnapshot(
+            ltp=ltp,
+            best_bid=bid,
+            best_ask=ask,
+            spread_bps=spread_bps,
+            lower_circuit=lower,
+            upper_circuit=upper,
+            observed_at=now_ist().isoformat(),
         )
-        return ltp, spread_bps, circuit_buffer
 
     def historical_candles(
         self,
@@ -1553,19 +2028,36 @@ class KiteBroker:
         return self.kite.trades()
 
     def positions(self) -> list[dict]:
-        return self.kite.positions().get("net", [])
+        payload = self.kite.positions()
+        if not isinstance(payload, dict) or not isinstance(payload.get("net"), list):
+            raise RuntimeError("Kite positions response is missing the net list")
+        return payload["net"]
+
+    def mis_position_quantities(self) -> dict[str, int]:
+        return parse_mis_position_quantities(self.positions())
 
     def current_intraday_pnl(self) -> float:
         total = 0.0
+        seen: set[str] = set()
 
-        for position in self.positions():
+        for index, position in enumerate(self.positions()):
+            if not isinstance(position, dict):
+                raise RuntimeError(f"broker position row {index} is not an object")
             if (
                 position.get("exchange") == "NSE"
                 and position.get("product") == "MIS"
             ):
-                total += safe_float(
-                    position.get("pnl")
-                )
+                symbol = str(position.get("tradingsymbol") or "").strip().upper()
+                if not symbol or symbol in seen:
+                    raise RuntimeError("invalid or duplicate NSE/MIS P&L position row")
+                seen.add(symbol)
+                try:
+                    total += strict_finite_float(
+                        position.get("pnl"),
+                        field=f"position[{symbol}].pnl",
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
 
         return total
 
@@ -1573,19 +2065,7 @@ class KiteBroker:
         self,
         symbol: str,
     ) -> int:
-        for position in self.positions():
-            if (
-                position.get("exchange") == "NSE"
-                and position.get("product") == "MIS"
-                and position.get("tradingsymbol") == symbol
-            ):
-                return int(
-                    safe_float(
-                        position.get("quantity")
-                    )
-                )
-
-        return 0
+        return self.mis_position_quantities().get(symbol.upper(), 0)
 
     def latest_order(
         self,
@@ -1624,8 +2104,9 @@ class KiteBroker:
         *,
         timeout_seconds: float,
         require_stop_armed: bool = False,
+        return_on_partial: bool = False,
     ) -> OrderSnapshot:
-        """Wait for a terminal order or verified trigger-pending stop."""
+        """Wait for a terminal, armed stop, or explicitly requested partial."""
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -1644,6 +2125,12 @@ class KiteBroker:
                 if last.terminal:
                     return last
                 if require_stop_armed and last.stop_armed:
+                    return last
+                if return_on_partial and last.filled > 0:
+                    # Entry callers immediately cancel the unfilled remainder,
+                    # then arm protection for the terminal confirmed quantity.
+                    # This avoids leaving a partial fill exposed for the full
+                    # entry timeout.
                     return last
 
             remaining = deadline - time.monotonic()
@@ -1670,10 +2157,15 @@ class KiteBroker:
         quantity: int,
     ) -> OrderSnapshot | None:
         matches: list[OrderSnapshot] = []
+        allowed_types = allowed_broker_order_types(order_type)
         for payload in self.orders():
             try:
                 snapshot = OrderSnapshot.from_payload(payload)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                if isinstance(payload, dict) and str(payload.get("tag") or "") == tag:
+                    raise RuntimeError(
+                        f"broker order matching tag {tag} is malformed"
+                    ) from exc
                 continue
             if (
                 snapshot.tag == tag
@@ -1681,7 +2173,7 @@ class KiteBroker:
                 and snapshot.exchange == "NSE"
                 and snapshot.product == "MIS"
                 and snapshot.transaction_type == transaction_type.upper()
-                and snapshot.order_type == order_type.upper()
+                and snapshot.order_type in allowed_types
                 and snapshot.qty == abs(quantity)
             ):
                 matches.append(snapshot)
@@ -2070,6 +2562,8 @@ def select_stocks_in_play(
                 day_range_pct=record["day_range_pct"],
                 gap_pct=record["gap_pct"],
                 circuit_buffer_pct=record["circuit_buffer_pct"],
+                lower_circuit_limit=record["lower_circuit_limit"],
+                upper_circuit_limit=record["upper_circuit_limit"],
                 stock_in_play_score=record["stock_in_play_score"],
             )
         )
@@ -2413,6 +2907,8 @@ def detect_setup(
         signal_at=(
             pd.Timestamp(last["date"]) + pd.Timedelta(minutes=5)
         ).isoformat(),
+        lower_circuit_limit=quote.lower_circuit_limit,
+        upper_circuit_limit=quote.upper_circuit_limit,
     )
 
 
@@ -2447,6 +2943,7 @@ Be conservative. Reject when:
 
 Do not invent news, fundamentals, support/resistance or facts not supplied.
 If uncertain, REJECT.
+Return only APPROVE or REJECT; ERROR is reserved for local transport failures.
 
 "confidence" means confidence in your APPROVE/REJECT judgment, not expected
 percentage return.
@@ -2469,13 +2966,28 @@ class AIFilter:
         self.last_response_id = ""
         self.last_latency_ms = 0
         self.last_error = ""
+        self.last_status = "NOT_RUN"
+        self.last_decision_id = ""
+        self.last_input_sha256 = ""
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_total_tokens = 0
 
     def review(
         self,
-        setup: Setup,
+        candidate_payload: dict[str, Any],
     ) -> AIDecision:
         started = time.monotonic()
+        self.last_response_model = ""
+        self.last_response_id = ""
+        self.last_latency_ms = 0
         self.last_error = ""
+        self.last_status = "RUNNING"
+        self.last_decision_id = uuid.uuid4().hex
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_total_tokens = 0
+        self.last_input_sha256 = stable_json_sha256(candidate_payload)
 
         try:
             response = self.client.responses.parse(
@@ -2488,10 +3000,12 @@ class AIFilter:
                     {
                         "role": "user",
                         "content": (
-                            "Review this candidate:\n"
-                            + json.dumps(
-                                asdict(setup),
-                                indent=2,
+                                "Review this candidate:\n"
+                                + json.dumps(
+                                candidate_payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
                             )
                         ),
                     },
@@ -2513,12 +3027,19 @@ class AIFilter:
                 raise RuntimeError(
                     "No structured AI output."
                 )
+            if decision.decision == "ERROR":
+                raise RuntimeError("AI returned reserved ERROR decision")
 
             self.last_response_model = str(response.model)
             self.last_response_id = str(response.id)
+            usage = getattr(response, "usage", None)
+            self.last_input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            self.last_output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            self.last_total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
             self.last_latency_ms = int(
                 (time.monotonic() - started) * 1000
             )
+            self.last_status = "OK"
             return decision
 
         except Exception as exc:
@@ -2526,14 +3047,15 @@ class AIFilter:
                 (time.monotonic() - started) * 1000
             )
             self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_status = "ERROR"
             log(
-                f"AI review failed; "
-                f"setup rejected: {self.last_error}"
+                f"AI review unavailable: {self.last_error}. "
+                "Gate mode blocks; shadow mode remains execution-neutral."
             )
 
             return AIDecision(
-                decision="REJECT",
-                confidence=100,
+                decision="ERROR",
+                confidence=0,
                 quality_score=0,
                 reason=(
                     "AI service/review failure; "
@@ -2575,6 +3097,116 @@ def planned_after_cost_stop_loss(
     return max(0.0, -expected_gross + float(costs.total))
 
 
+def estimate_after_cost_outcome(
+    side: str,
+    entry_price: float,
+    stop_distance: float,
+    target_distance: float,
+    qty: int,
+    tick_size: float,
+    *,
+    include_entry_slippage: bool = True,
+) -> AfterCostOutcome:
+    """Model the actual adverse-entry repricing, exits, and two-leg fees."""
+    if qty <= 0:
+        return AfterCostOutcome(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if (
+        not math.isfinite(tick_size)
+        or tick_size <= 0
+        or not all(
+            math.isfinite(value) and value > 0
+            for value in (entry_price, stop_distance, target_distance)
+        )
+    ):
+        raise ValueError("entry, distances and tick size must be positive")
+
+    slippage = RISK_SLIPPAGE_BPS / 10_000
+    entry_slippage = slippage if include_entry_slippage else 0.0
+    if side == "LONG":
+        entry_fill = entry_price * (1 + entry_slippage)
+        stop_reference = round_to_tick(entry_fill - stop_distance, tick_size)
+        target_reference = round_to_tick(entry_fill + target_distance, tick_size)
+        stop_fill = stop_reference * (1 - slippage)
+        target_fill = target_reference * (1 - slippage)
+        stop_costs = estimate_nse_equity_intraday_cost(
+            entry_fill * qty,
+            stop_fill * qty,
+        )
+        target_costs = estimate_nse_equity_intraday_cost(
+            entry_fill * qty,
+            target_fill * qty,
+        )
+    elif side == "SHORT":
+        entry_fill = entry_price * (1 - entry_slippage)
+        stop_reference = round_to_tick(entry_fill + stop_distance, tick_size)
+        target_reference = round_to_tick(entry_fill - target_distance, tick_size)
+        stop_fill = stop_reference * (1 + slippage)
+        target_fill = target_reference * (1 + slippage)
+        stop_costs = estimate_nse_equity_intraday_cost(
+            stop_fill * qty,
+            entry_fill * qty,
+        )
+        target_costs = estimate_nse_equity_intraday_cost(
+            target_fill * qty,
+            entry_fill * qty,
+        )
+    else:
+        raise ValueError("side must be LONG or SHORT")
+
+    stop_gross = float(gross_pnl(side, entry_fill, stop_fill, qty))
+    target_gross = float(gross_pnl(side, entry_fill, target_fill, qty))
+    stop_loss = max(0.0, -stop_gross + float(stop_costs.total))
+    target_profit = target_gross - float(target_costs.total)
+    payoff = target_profit / stop_loss if stop_loss > 0 else 0.0
+    return AfterCostOutcome(
+        entry_fill=entry_fill,
+        stop_reference=stop_reference,
+        target_reference=target_reference,
+        stop_fill=stop_fill,
+        target_fill=target_fill,
+        stop_loss=stop_loss,
+        target_profit=target_profit,
+        payoff_ratio=payoff,
+    )
+
+
+def validate_price_band_geometry(
+    side: str,
+    stop_price: float,
+    target_price: float,
+    lower_circuit: float,
+    upper_circuit: float,
+    ltp: float,
+    tick_size: float,
+) -> tuple[bool, str]:
+    values = (
+        stop_price,
+        target_price,
+        lower_circuit,
+        upper_circuit,
+        ltp,
+        tick_size,
+    )
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        return False, "INVALID_PRICE_BAND_DATA"
+    if not lower_circuit < ltp < upper_circuit:
+        return False, "INVALID_PRICE_BAND_ORDER"
+    headroom = max(2 * tick_size, ltp * CIRCUIT_HEADROOM_BPS / 10_000)
+    if side == "LONG":
+        if stop_price < lower_circuit + headroom:
+            return False, "LONG_STOP_OUTSIDE_PRICE_BAND"
+        if target_price > upper_circuit - headroom:
+            return False, "LONG_TARGET_OUTSIDE_PRICE_BAND"
+    elif side == "SHORT":
+        if stop_price > upper_circuit - headroom:
+            return False, "SHORT_STOP_OUTSIDE_PRICE_BAND"
+        if target_price < lower_circuit + headroom:
+            return False, "SHORT_TARGET_OUTSIDE_PRICE_BAND"
+    else:
+        return False, "INVALID_TRADE_SIDE"
+    return True, "OK"
+
+
 def max_qty_within_stop_budget(
     side: str,
     entry_price: float,
@@ -2599,6 +3231,149 @@ def max_qty_within_stop_budget(
             high = candidate - 1
     return result
 
+
+def _candidate_reserved_risk(trade: Trade) -> float:
+    for value in (trade.reserved_risk_amount, trade.planned_risk_amount):
+        if math.isfinite(value) and value > 0:
+            return float(value)
+    estimated = planned_after_cost_stop_loss(
+        trade.side,
+        trade.entry_price,
+        trade.stop_price,
+        trade.qty,
+    )
+    return float(estimated)
+
+
+def entry_capacity(
+    state: dict,
+    *,
+    exclude_symbol: str | None = None,
+) -> EntryCapacity:
+    """Compute remaining loss and notional capacity from durable active state."""
+    if state.get("kill_switch"):
+        return EntryCapacity(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False, "KILL_SWITCH")
+
+    open_risk = 0.0
+    open_notional = 0.0
+    try:
+        for symbol, record in state.get("trades", {}).items():
+            if exclude_symbol and str(symbol).upper() == exclude_symbol.upper():
+                continue
+            if not isinstance(record, dict):
+                raise RuntimeError("INVALID_ACTIVE_TRADE_RECORD")
+            status = str(record.get("status", "")).upper()
+            if status not in ACTIVE_TRADE_STATUSES and not status.startswith("OPEN"):
+                continue
+            trade = trade_from_dict(record)
+            risk = trade.reserved_risk_amount or trade.planned_risk_amount
+            if not math.isfinite(risk) or risk <= 0:
+                raise RuntimeError(f"{trade.symbol}_ACTIVE_RISK_UNRESOLVED")
+            qty = trade.qty or trade.requested_qty
+            notional = max(
+                abs(trade.entry_price * qty),
+                float(trade.reserved_notional_amount or 0.0),
+            )
+            if not math.isfinite(notional) or notional <= 0:
+                raise RuntimeError(f"{trade.symbol}_ACTIVE_NOTIONAL_UNRESOLVED")
+            open_risk += risk
+            open_notional += notional
+    except Exception as exc:
+        return EntryCapacity(
+            open_risk,
+            open_notional,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            False,
+            f"ACTIVE_RISK_INVALID_{type(exc).__name__}:{exc}",
+        )
+
+    try:
+        realized = strict_finite_float(
+            state.get("realized_pnl", 0.0),
+            field="state.realized_pnl",
+        )
+    except ValueError as exc:
+        return EntryCapacity(
+            open_risk,
+            open_notional,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            False,
+            f"REALIZED_PNL_INVALID:{exc}",
+        )
+
+    # Profits never expand the day's risk allowance; losses consume it.
+    realized_debit = min(0.0, realized)
+    daily_remaining = max(
+        0.0,
+        CAPITAL_LIMIT * MAX_DAILY_LOSS_PCT + realized_debit - open_risk,
+    )
+    portfolio_remaining = max(
+        0.0,
+        CAPITAL_LIMIT * MAX_PORTFOLIO_STOP_RISK_PCT - open_risk,
+    )
+    gross_remaining = max(
+        0.0,
+        CAPITAL_LIMIT * MAX_GROSS_EXPOSURE_PCT - open_notional,
+    )
+    risk_budget = max(
+        0.0,
+        min(
+            CAPITAL_LIMIT * RISK_PER_TRADE_PCT,
+            daily_remaining,
+            portfolio_remaining,
+        ),
+    )
+    notional_budget = max(
+        0.0,
+        min(CAPITAL_LIMIT * MAX_POSITION_PCT, gross_remaining),
+    )
+    allowed = risk_budget > 0 and notional_budget > 0
+    reason = "OK" if allowed else "PORTFOLIO_CAPACITY_EXHAUSTED"
+    return EntryCapacity(
+        open_reserved_risk=open_risk,
+        open_gross_notional=open_notional,
+        daily_risk_remaining=daily_remaining,
+        portfolio_risk_remaining=portfolio_remaining,
+        gross_notional_remaining=gross_remaining,
+        candidate_risk_budget=risk_budget,
+        candidate_notional_budget=notional_budget,
+        allowed=allowed,
+        reason=reason,
+    )
+
+
+def assess_trade_admission(
+    state: dict,
+    trade: Trade,
+    *,
+    exclude_symbol: str | None = None,
+) -> tuple[bool, str]:
+    capacity = entry_capacity(state, exclude_symbol=exclude_symbol)
+    if not capacity.allowed:
+        return False, capacity.reason
+    candidate_risk = _candidate_reserved_risk(trade)
+    candidate_notional = max(
+        abs(trade.entry_price * (trade.qty or trade.requested_qty)),
+        float(trade.reserved_notional_amount or 0.0),
+    )
+    if not math.isfinite(candidate_risk) or candidate_risk <= 0:
+        return False, "CANDIDATE_RISK_INVALID"
+    if not math.isfinite(candidate_notional) or candidate_notional <= 0:
+        return False, "CANDIDATE_NOTIONAL_INVALID"
+    if candidate_risk > capacity.candidate_risk_budget + 1e-9:
+        return False, "REMAINING_RISK_BUDGET_EXCEEDED"
+    if candidate_notional > capacity.candidate_notional_budget + 1e-9:
+        return False, "REMAINING_GROSS_EXPOSURE_EXCEEDED"
+    return True, "OK"
+
 def revalidate_live_setup(
     broker: KiteBroker,
     setup: Setup,
@@ -2617,14 +3392,28 @@ def revalidate_live_setup(
         return None, f"STALE_SIGNAL_{age_seconds:.0f}s"
 
     live_spread = setup.spread_bps
+    lower_circuit = setup.lower_circuit_limit
+    upper_circuit = setup.upper_circuit_limit
     try:
         execution_snapshot = getattr(broker, "execution_snapshot", None)
         if execution_snapshot is None:
             live_price = broker.ltp(setup.symbol)
         else:
-            live_price, live_spread, circuit_buffer = execution_snapshot(
-                setup.symbol
-            )
+            observed = execution_snapshot(setup.symbol)
+            if isinstance(observed, ExecutionSnapshot):
+                live_price = observed.ltp
+                live_spread = observed.spread_bps
+                lower_circuit = observed.lower_circuit
+                upper_circuit = observed.upper_circuit
+                circuit_buffer = min(
+                    (upper_circuit - live_price) / live_price * 100,
+                    (live_price - lower_circuit) / live_price * 100,
+                )
+            else:
+                # Backward-compatible test/broker adapter shape. New real
+                # adapters must return ExecutionSnapshot so directional bands
+                # are preserved.
+                live_price, live_spread, circuit_buffer = observed
             if live_spread > MAX_SPREAD_BPS:
                 return None, f"LIVE_SPREAD_{live_spread:.1f}BPS"
             if circuit_buffer < MIN_CIRCUIT_BUFFER_PCT:
@@ -2665,19 +3454,24 @@ def revalidate_live_setup(
         spread_bps=live_spread,
         breakout_distance_atr=breakout_atr,
         vwap_distance_atr=abs(live_price - setup.vwap) / setup.atr,
+        lower_circuit_limit=lower_circuit,
+        upper_circuit_limit=upper_circuit,
     ), "OK"
 
 
-def build_trade(
+def build_trade_result(
     broker: KiteBroker,
     setup: Setup,
-) -> Trade | None:
+    *,
+    risk_budget: float | None = None,
+    notional_budget: float | None = None,
+) -> TradeBuildResult:
     inst = broker.instrument(
         setup.symbol
     )
 
     if not inst:
-        return None
+        return TradeBuildResult(None, "INSTRUMENT_UNAVAILABLE")
 
     stop_distance = (
         setup.atr
@@ -2693,27 +3487,30 @@ def build_trade(
         stop_pct < 0.003
         or stop_pct > 0.03
     ):
-        return None
+        return TradeBuildResult(None, f"STOP_DISTANCE_{stop_pct:.4f}")
 
-    rupee_risk_budget = (
-        CAPITAL_LIMIT
-        * RISK_PER_TRADE_PCT
+    rupee_risk_budget = float(
+        risk_budget
+        if risk_budget is not None
+        else CAPITAL_LIMIT * RISK_PER_TRADE_PCT
     )
-
-    max_notional = (
-        CAPITAL_LIMIT
-        * MAX_POSITION_PCT
+    max_notional = float(
+        notional_budget
+        if notional_budget is not None
+        else CAPITAL_LIMIT * MAX_POSITION_PCT
     )
+    if rupee_risk_budget <= 0 or max_notional <= 0:
+        return TradeBuildResult(None, "NO_REMAINING_ENTRY_CAPACITY")
 
     qty_by_risk = math.floor(
         rupee_risk_budget
         / stop_distance
     )
 
-    qty_by_notional = math.floor(
-        max_notional
-        / setup.price
+    conservative_notional_price = setup.price * (
+        1 + RISK_SLIPPAGE_BPS / 10_000
     )
+    qty_by_notional = math.floor(max_notional / conservative_notional_price)
 
     qty = max(
         0,
@@ -2745,6 +3542,19 @@ def build_trade(
         )
 
     stop_price = round_to_tick(raw_stop, inst.tick_size)
+    target_price = round_to_tick(raw_target, inst.tick_size)
+    band_ok, band_reason = validate_price_band_geometry(
+        setup.side,
+        stop_price,
+        target_price,
+        setup.lower_circuit_limit,
+        setup.upper_circuit_limit,
+        setup.price,
+        inst.tick_size,
+    )
+    if not band_ok:
+        return TradeBuildResult(None, band_reason)
+
     qty = max_qty_within_stop_budget(
         setup.side,
         setup.price,
@@ -2754,10 +3564,7 @@ def build_trade(
     )
 
     if qty < 1:
-        log(
-            f"{setup.symbol}: no quantity fits the after-cost stop budget."
-        )
-        return None
+        return TradeBuildResult(None, "NO_QUANTITY_WITHIN_AFTER_COST_RISK")
 
     planned_risk = planned_after_cost_stop_loss(
         setup.side,
@@ -2765,8 +3572,38 @@ def build_trade(
         stop_price,
         qty,
     )
+    outcome = estimate_after_cost_outcome(
+        setup.side,
+        setup.price,
+        stop_distance,
+        stop_distance * TARGET_R_MULTIPLE,
+        qty,
+        inst.tick_size,
+    )
+    modeled_band_ok, modeled_band_reason = validate_price_band_geometry(
+        setup.side,
+        outcome.stop_reference,
+        outcome.target_reference,
+        setup.lower_circuit_limit,
+        setup.upper_circuit_limit,
+        outcome.entry_fill,
+        inst.tick_size,
+    )
+    if not modeled_band_ok:
+        return TradeBuildResult(None, f"MODELED_{modeled_band_reason}", outcome)
+    if outcome.target_profit <= 0:
+        return TradeBuildResult(None, "NONPOSITIVE_AFTER_COST_TARGET", outcome)
+    if outcome.payoff_ratio < MIN_AFTER_COST_PAYOFF_RATIO:
+        return TradeBuildResult(
+            None,
+            (
+                f"AFTER_COST_PAYOFF_{outcome.payoff_ratio:.3f}_LT_"
+                f"{MIN_AFTER_COST_PAYOFF_RATIO:.3f}"
+            ),
+            outcome,
+        )
 
-    return Trade(
+    trade = Trade(
         symbol=setup.symbol,
         token=setup.token,
         side=setup.side,
@@ -2774,15 +3611,34 @@ def build_trade(
         entry_price=setup.price,
         initial_risk_per_share=stop_distance,
         stop_price=stop_price,
-        target_price=round_to_tick(
-            raw_target,
-            inst.tick_size,
-        ),
+        target_price=target_price,
         opened_at=now_ist().isoformat(),
         client_tag=new_order_tag("TRD"),
         requested_qty=qty,
         planned_risk_amount=planned_risk,
+        reserved_risk_amount=planned_risk,
+        reserved_notional_amount=conservative_notional_price * qty,
+        planned_target_profit_amount=outcome.target_profit,
+        planned_after_cost_payoff=outcome.payoff_ratio,
+        execution_mode=current_execution_mode(),
     )
+    return TradeBuildResult(trade, "OK", outcome)
+
+
+def build_trade(
+    broker: KiteBroker,
+    setup: Setup,
+    *,
+    risk_budget: float | None = None,
+    notional_budget: float | None = None,
+) -> Trade | None:
+    """Backward-compatible wrapper for callers that only need the trade."""
+    return build_trade_result(
+        broker,
+        setup,
+        risk_budget=risk_budget,
+        notional_budget=notional_budget,
+    ).trade
 
 
 # =============================================================================
@@ -2790,15 +3646,41 @@ def build_trade(
 # =============================================================================
 
 def persist_trade(state: dict, trade: Trade) -> None:
+    """Atomically mirror a trade to memory only if the durable write succeeds."""
+    runtime_mode = current_execution_mode()
+    trade.execution_mode = trade.execution_mode or runtime_mode
+    if trade.execution_mode != runtime_mode:
+        raise RuntimeError(
+            f"refusing to persist {trade.execution_mode} trade in "
+            f"{runtime_mode} runtime"
+        )
+    missing = object()
+    previous_mode = state.get("execution_mode", missing)
+    previous_trade = state["trades"].get(trade.symbol, missing)
+    state["execution_mode"] = runtime_mode
     state["trades"][trade.symbol] = asdict(trade)
-    save_state(state)
+    try:
+        save_state(state)
+    except Exception:
+        if previous_mode is missing:
+            state.pop("execution_mode", None)
+        else:
+            state["execution_mode"] = previous_mode
+        if previous_trade is missing:
+            state["trades"].pop(trade.symbol, None)
+        else:
+            state["trades"][trade.symbol] = previous_trade
+        raise
 
 
 def halt_trading(state: dict, reason: str) -> None:
     state["kill_switch"] = True
     state["halt_reason"] = reason
-    save_state(state)
-    journal("HALT", reason=reason)
+    try:
+        save_state(state)
+    except Exception as exc:
+        log(f"STATE WRITE FAILURE while halting: {type(exc).__name__}: {exc}")
+    journal_best_effort("HALT", reason=reason)
     log(f"TRADING HALTED: {reason}")
 
 
@@ -2858,6 +3740,111 @@ def submit_or_recover_order(
         ) from submit_error
 
 
+def emergency_flatten_without_state(
+    broker: KiteBroker,
+    trade: Trade,
+    reason: str,
+    *,
+    unresolved_order_intent: bool = False,
+) -> bool:
+    """Last-resort live flatten that does not depend on disk or journals."""
+    if not LIVE_TRADING:
+        return True
+    inst = broker.instrument(trade.symbol)
+    if inst is None:
+        log(f"CRITICAL {trade.symbol}: emergency flatten has no instrument")
+        return False
+    if unresolved_order_intent:
+        log(
+            f"CRITICAL {trade.symbol}: emergency flatten cannot prove an "
+            "ambiguous order intent absent; manual reconciliation required"
+        )
+        return False
+
+    def stable_position(expected: int) -> bool:
+        if broker.position_qty(trade.symbol) != expected:
+            return False
+        time.sleep(min(max(ORDER_POLL_SECONDS, 0.01), 0.50))
+        return broker.position_qty(trade.symbol) == expected
+
+    try:
+        # Never race a separate exit against an owned entry, stop, or prior
+        # exit. Unresolved cancellation is a manual-reconciliation condition.
+        if not cancel_active_trade_orders(broker, trade):
+            log(
+                f"CRITICAL {trade.symbol}: emergency flatten blocked because "
+                "an owned order is not confirmed terminal"
+            )
+            return False
+
+        reducing_ids = list(
+            dict.fromkeys(
+                [trade.stop_order_id, trade.exit_order_id, *trade.exit_order_ids]
+            )
+        )
+        if any(reducing_ids):
+            reduced = broker_filled_quantity(broker, reducing_ids)
+            if reduced > trade.qty:
+                log(
+                    f"CRITICAL {trade.symbol}: confirmed reducing fills exceed "
+                    "the tracked entry; refusing another exit"
+                )
+                return False
+            if reduced == trade.qty:
+                # The broker already confirms a full reducing fill. A nonzero
+                # position can be settlement lag; another order could reverse.
+                return stable_position(0)
+
+        signed_qty = broker.position_qty(trade.symbol)
+        if signed_qty == 0:
+            return stable_position(0)
+        tag = new_order_tag("EXT")
+        order_id = submit_or_recover_order(
+            broker,
+            lambda: broker.exit_market(inst, signed_qty, tag),
+            tag=tag,
+            symbol=trade.symbol,
+            transaction_type="SELL" if signed_qty > 0 else "BUY",
+            order_type="MARKET",
+            quantity=abs(signed_qty),
+        )
+        trade.exit_tag = tag
+        trade.exit_tags.append(tag)
+        trade.exit_order_id = order_id
+        if order_id not in trade.exit_order_ids:
+            trade.exit_order_ids.append(order_id)
+        result = broker.wait_for_order(
+            order_id,
+            timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+        )
+        if not result.terminal:
+            result = broker.cancel_order_confirmed(
+                order_id,
+                timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+            )
+        flat = bool(
+            result
+            and result.terminal
+            and broker.wait_for_position_qty(
+                trade.symbol,
+                0,
+                timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+            )
+            and stable_position(0)
+        )
+        if not flat:
+            log(
+                f"CRITICAL {trade.symbol}: emergency flatten not verified ({reason})"
+            )
+        return flat
+    except Exception as exc:
+        log(
+            f"CRITICAL {trade.symbol}: state-independent emergency flatten "
+            f"failed ({reason}): {type(exc).__name__}: {exc}"
+        )
+        return False
+
+
 def update_prices_from_entry(
     trade: Trade,
     inst: Instrument,
@@ -2886,6 +3873,24 @@ def update_prices_from_entry(
         )
 
 
+def refresh_trade_economics_after_fill(trade: Trade, inst: Instrument) -> None:
+    """Recompute nonlinear fee/risk metrics for the confirmed filled quantity."""
+    outcome = estimate_after_cost_outcome(
+        trade.side,
+        trade.entry_price,
+        trade.initial_risk_per_share,
+        trade.initial_risk_per_share * TARGET_R_MULTIPLE,
+        trade.qty,
+        inst.tick_size,
+        include_entry_slippage=False,
+    )
+    trade.planned_risk_amount = outcome.stop_loss
+    trade.reserved_risk_amount = outcome.stop_loss
+    trade.reserved_notional_amount = abs(trade.entry_price * trade.qty)
+    trade.planned_target_profit_amount = outcome.target_profit
+    trade.planned_after_cost_payoff = outcome.payoff_ratio
+
+
 # =============================================================================
 # Verified execution / monitoring lifecycle
 # =============================================================================
@@ -2902,18 +3907,33 @@ def broker_fill_average(
     total_qty = 0
     total_value = 0.0
     try:
-        for row in broker.trades():
+        rows = broker.trades()
+        if not isinstance(rows, list):
+            raise RuntimeError("broker trades payload must be a list")
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise RuntimeError(f"broker trade row {index} is not an object")
             if str(row.get("order_id")) not in ids:
                 continue
-            qty = int(safe_float(row.get("quantity")))
-            price = safe_float(row.get("average_price")) or safe_float(
-                row.get("price")
+            qty = strict_integral(
+                row.get("quantity"),
+                field=f"trade[{index}].quantity",
             )
-            if qty > 0 and price > 0:
-                total_qty += qty
-                total_value += qty * price
+            price_value = row.get("average_price") or row.get("price")
+            price = strict_finite_float(
+                price_value,
+                field=f"trade[{index}].price",
+            )
+            if qty <= 0 or price <= 0:
+                raise RuntimeError(f"broker trade row {index} has invalid fill")
+            total_qty += qty
+            total_value += qty * price
+    except (ValueError, RuntimeError):
+        raise
     except Exception:
-        pass
+        # A transport failure can use fully resolved order snapshots below.
+        total_qty = 0
+        total_value = 0.0
     if total_qty > 0:
         return total_value / total_qty
 
@@ -2942,15 +3962,27 @@ def broker_filled_quantity(
     quantities = {order_id: 0 for order_id in ids}
     resolved_ids: set[str] = set()
     try:
-        for row in broker.trades():
+        rows = broker.trades()
+        if not isinstance(rows, list):
+            raise RuntimeError("broker trades payload must be a list")
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise RuntimeError(f"broker trade row {index} is not an object")
             order_id = str(row.get("order_id"))
             if order_id not in ids:
                 continue
-            quantity = int(safe_float(row.get("quantity")))
-            if quantity > 0:
-                quantities[order_id] += quantity
-                resolved_ids.add(order_id)
+            quantity = strict_integral(
+                row.get("quantity"),
+                field=f"trade[{index}].quantity",
+            )
+            if quantity <= 0:
+                raise RuntimeError(f"broker trade row {index} has invalid quantity")
+            quantities[order_id] += quantity
+            resolved_ids.add(order_id)
+    except (ValueError, RuntimeError):
+        raise
     except Exception:
+        # REST unavailability may still be resolved from order snapshots.
         pass
     for order_id in ids:
         try:
@@ -3081,7 +4113,7 @@ def stop_identity_matches(
         stop.symbol == trade.symbol.upper()
         and stop.exchange == "NSE"
         and stop.product == "MIS"
-        and stop.order_type in {"SL-M", "SLM"}
+        and stop.order_type in allowed_broker_order_types("SL-M")
         and stop.transaction_type == expected_transaction
         and stop.qty == order_qty
         and bool(trade.stop_tag)
@@ -3096,7 +4128,7 @@ def entry_identity_matches(entry: OrderSnapshot, trade: Trade) -> bool:
         and entry.symbol == trade.symbol.upper()
         and entry.exchange == "NSE"
         and entry.product == "MIS"
-        and entry.order_type == "MARKET"
+        and entry.order_type in allowed_broker_order_types("MARKET")
         and entry.transaction_type == ("BUY" if trade.side == "LONG" else "SELL")
         and entry.qty == (trade.requested_qty or trade.qty)
         and bool(trade.entry_tag)
@@ -3105,6 +4137,11 @@ def entry_identity_matches(entry: OrderSnapshot, trade: Trade) -> bool:
 
 
 def exit_identity_matches(exit_order: OrderSnapshot, trade: Trade) -> bool:
+    expected_transaction = (
+        trade.exit_intent_transaction
+        or ("SELL" if trade.side == "LONG" else "BUY")
+    )
+    expected_quantity = abs(trade.exit_intent_qty) if trade.exit_intent_qty else 0
     return bool(
         (
             exit_order.order_id in set(trade.exit_order_ids + [trade.exit_order_id])
@@ -3116,9 +4153,10 @@ def exit_identity_matches(exit_order: OrderSnapshot, trade: Trade) -> bool:
         and exit_order.symbol == trade.symbol.upper()
         and exit_order.exchange == "NSE"
         and exit_order.product == "MIS"
-        and exit_order.order_type == "MARKET"
-        and exit_order.transaction_type in {"BUY", "SELL"}
+        and exit_order.order_type in allowed_broker_order_types("MARKET")
+        and exit_order.transaction_type == expected_transaction
         and exit_order.qty > 0
+        and (not expected_quantity or exit_order.qty == expected_quantity)
         and bool(exit_order.tag)
         and exit_order.tag in set(trade.exit_tags)
     )
@@ -3138,7 +4176,7 @@ def order_owned_for_cancellation(
             snapshot.symbol == trade.symbol.upper()
             and snapshot.exchange == "NSE"
             and snapshot.product == "MIS"
-            and snapshot.order_type in {"SL-M", "SLM", "MARKET"}
+            and snapshot.order_type in allowed_broker_order_types("SL-M")
             and snapshot.transaction_type == expected_transaction
             and snapshot.qty == trade.qty
             and bool(trade.stop_tag)
@@ -3181,15 +4219,9 @@ def apply_confirmed_entry_snapshot(
         trade.accounting_note = "confirmed entry fill price unavailable"
         trade.qty = entry.filled
         return
-    if (
-        trade.planned_risk_amount > 0
-        and trade.requested_qty > 0
-        and trade.qty == trade.requested_qty
-        and entry.filled < trade.requested_qty
-    ):
-        trade.planned_risk_amount *= entry.filled / trade.requested_qty
     trade.qty = entry.filled
     update_prices_from_entry(trade, inst, average)
+    refresh_trade_economics_after_fill(trade, inst)
 
 
 def mark_trade_closed(
@@ -3206,6 +4238,16 @@ def mark_trade_closed(
         return False
 
     trade = trade_from_dict(data)
+    accounting_before = {
+        key: state.get(key)
+        for key in (
+            "realized_pnl",
+            "fees_paid",
+            "consecutive_losses",
+            "kill_switch",
+            "halt_reason",
+        )
+    }
     trade.closed_at = now_ist().isoformat()
     trade.exit_reason = reason
     trade.exit_order_id = exit_order_id or trade.exit_order_id
@@ -3224,12 +4266,15 @@ def mark_trade_closed(
             f"{symbol} is flat but its actual exit price is unresolved"
         )
         persist_trade(state, trade)
-        journal(
+        journal_best_effort(
             "CLOSE",
             symbol=symbol,
+            idea_id=trade.idea_id,
+            ai_review_idea_id=trade.ai_review_idea_id,
             reason=reason,
-            ai_mode=AI_MODE,
+            ai_mode=trade.ai_mode or AI_MODE,
             ai_decision=trade.ai_decision,
+            execution_mode=trade.execution_mode or current_execution_mode(),
             pricing_status="UNRESOLVED",
             accounting_note=trade.accounting_note,
         )
@@ -3276,10 +4321,25 @@ def mark_trade_closed(
         state["kill_switch"] = True
         state["halt_reason"] = "consecutive loss limit reached"
 
-    persist_trade(state, trade)
-    journal(
+    try:
+        persist_trade(state, trade)
+    except Exception:
+        for key, value in accounting_before.items():
+            state[key] = value
+        state["kill_switch"] = True
+        state["halt_reason"] = (
+            f"{symbol} closure accounting could not be persisted"
+        )
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        raise
+    journal_best_effort(
         "CLOSE",
         symbol=symbol,
+        idea_id=trade.idea_id,
+        ai_review_idea_id=trade.ai_review_idea_id,
         side=trade.side,
         qty=trade.qty,
         reason=reason,
@@ -3289,13 +4349,19 @@ def mark_trade_closed(
         fees=trade.fees,
         net_pnl=trade.net_pnl,
         r_multiple=trade.r_multiple,
-        ai_mode=AI_MODE,
+        ai_mode=trade.ai_mode or AI_MODE,
         ai_decision=trade.ai_decision,
         ai_valid=trade.ai_valid,
         ai_error=trade.ai_error,
         ai_response_model=trade.ai_response_model,
         ai_response_id=trade.ai_response_id,
         ai_prompt_version=trade.ai_prompt_version,
+        ai_decision_id=trade.ai_decision_id,
+        ai_input_sha256=trade.ai_input_sha256,
+        ai_input_tokens=trade.ai_input_tokens,
+        ai_output_tokens=trade.ai_output_tokens,
+        ai_total_tokens=trade.ai_total_tokens,
+        execution_mode=trade.execution_mode or current_execution_mode(),
         entry_order_id=trade.entry_order_id,
         exit_order_ids=trade.exit_order_ids,
     )
@@ -3323,13 +4389,52 @@ def close_trade_market(
         return False
 
     if not LIVE_TRADING:
+        if trade.execution_mode not in {"", "paper"}:
+            halt_trading(
+                state,
+                f"{symbol}: refusing paper close for {trade.execution_mode} trade",
+            )
+            return False
+        if any(not order_id.startswith("DRY-") for order_id in _all_trade_order_ids(trade)):
+            halt_trading(
+                state,
+                f"{symbol}: non-DRY order identity requires live reconciliation",
+            )
+            return False
         if reference_price is None:
             try:
                 reference_price = broker.ltp(symbol)
-            except Exception:
-                reference_price = (
-                    trade.stop_price if "STOP" in reason else trade.target_price
+            except Exception as exc:
+                trade.accounting_uncertain = True
+                trade.accounting_note = (
+                    f"paper exit quote unavailable: {type(exc).__name__}: {exc}"
                 )
+                trade.exit_order_id = (
+                    f"DRY-UNPRICED-{symbol}-{new_order_tag('EXT')}"
+                )
+                trade.exit_order_ids.append(trade.exit_order_id)
+                state["trades"][symbol] = asdict(trade)
+                result = mark_trade_closed(
+                    state,
+                    symbol,
+                    reason,
+                    exit_price=0.0,
+                    exit_order_id=trade.exit_order_id,
+                )
+                if result:
+                    log(f"PAPER CLOSED_UNPRICED {symbol}: {reason}")
+                return result
+        if reference_price is None or not math.isfinite(reference_price) or reference_price <= 0:
+            trade.accounting_uncertain = True
+            trade.accounting_note = "paper exit reference price is invalid"
+            state["trades"][symbol] = asdict(trade)
+            return mark_trade_closed(
+                state,
+                symbol,
+                reason,
+                exit_price=0.0,
+                exit_order_id=trade.exit_order_id,
+            )
         transaction = "SELL" if trade.side == "LONG" else "BUY"
         exit_price = paper_fill_price(float(reference_price), transaction)
         trade.exit_order_id = f"DRY-EXIT-{symbol}-{new_order_tag('EXT')}"
@@ -3348,7 +4453,19 @@ def close_trade_market(
         return result
 
     trade.status = "EXIT_PENDING"
-    persist_trade(state, trade)
+    try:
+        persist_trade(state, trade)
+    except Exception as exc:
+        halt_trading(
+            state,
+            f"{symbol}: exit intent persistence failed: {type(exc).__name__}: {exc}",
+        )
+        emergency_flatten_without_state(
+            broker,
+            trade,
+            "EXIT_INTENT_PERSISTENCE_FAILURE",
+        )
+        return False
 
     entry_snapshot: OrderSnapshot | None = None
     if not trade.entry_order_id and trade.entry_tag:
@@ -3615,6 +4732,11 @@ def close_trade_market(
                     raise RuntimeError("stop cancellation fills have not settled")
             except Exception as exc:
                 halt_trading(state, f"{symbol}: stop cancellation unresolved: {exc}")
+                emergency_flatten_without_state(
+                    broker,
+                    trade,
+                    "STOP_CANCELLATION_UNRESOLVED",
+                )
                 return False
 
     qty_now = broker.position_qty(symbol)
@@ -3632,7 +4754,19 @@ def close_trade_market(
         trade.exit_attempts += 1
         trade.exit_intent_qty = qty_now
         trade.exit_intent_transaction = "SELL" if qty_now > 0 else "BUY"
-        persist_trade(state, trade)  # durable intent before mutation
+        try:
+            persist_trade(state, trade)  # durable intent before mutation
+        except Exception as exc:
+            halt_trading(
+                state,
+                f"{symbol}: exit order intent persistence failed: {exc}",
+            )
+            emergency_flatten_without_state(
+                broker,
+                trade,
+                "EXIT_ORDER_INTENT_PERSISTENCE_FAILURE",
+            )
+            return False
         transaction = trade.exit_intent_transaction
         try:
             exit_order_id = submit_or_recover_order(
@@ -3679,6 +4813,14 @@ def close_trade_market(
                 state,
                 f"{symbol}: exit state uncertain: {type(exc).__name__}: {exc}",
             )
+            emergency_flatten_without_state(
+                broker,
+                trade,
+                "EXIT_STATE_UNCERTAIN",
+                unresolved_order_intent=bool(
+                    trade.exit_tag and not trade.exit_order_id
+                ),
+            )
             return False
 
     if broker.position_qty(symbol) != 0:
@@ -3723,6 +4865,52 @@ def close_trade_market(
     return result
 
 
+def fail_safe_trade_lifecycle(
+    broker: KiteBroker,
+    state: dict,
+    trade: Trade,
+    reason: str,
+    *,
+    unresolved_order_intent: bool = False,
+) -> None:
+    """Halt and guarantee best-effort protection/flatten after any mutation."""
+    trade.status = "HALTED_UNCERTAIN"
+    trade.execution_mode = trade.execution_mode or current_execution_mode()
+    state.setdefault("trades", {})[trade.symbol] = asdict(trade)
+    try:
+        save_state(state)
+    except Exception as exc:
+        log(
+            f"{trade.symbol}: state unavailable during failure handling: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    halt_trading(state, reason)
+    try:
+        close_trade_market(
+            broker,
+            state,
+            trade.symbol,
+            "EXECUTION_FAILURE",
+        )
+    except Exception as exc:
+        log(
+            f"{trade.symbol}: normal failure flatten unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if LIVE_TRADING:
+        try:
+            still_open = broker.position_qty(trade.symbol) != 0
+        except Exception:
+            still_open = True
+        if still_open:
+            emergency_flatten_without_state(
+                broker,
+                trade,
+                reason,
+                unresolved_order_intent=unresolved_order_intent,
+            )
+
+
 def execute_trade(
     broker: KiteBroker,
     trade: Trade,
@@ -3738,10 +4926,35 @@ def execute_trade(
     if state.get("kill_switch"):
         log(f"{trade.symbol}: entry blocked by kill switch.")
         return
+    if not entry_window_open():
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason="ENTRY_CUTOFF",
+            evaluated_at=now_ist().isoformat(),
+            deadline=entry_deadline(now_ist()).isoformat(),
+        )
+        return
+
+    trade.execution_mode = trade.execution_mode or current_execution_mode()
+    trade.requested_qty = trade.requested_qty or trade.qty
+    if trade.reserved_risk_amount <= 0:
+        trade.reserved_risk_amount = _candidate_reserved_risk(trade)
+    if trade.planned_risk_amount <= 0:
+        trade.planned_risk_amount = trade.reserved_risk_amount
+    admitted, admission_reason = assess_trade_admission(state, trade)
+    if not admitted:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=admission_reason,
+        )
+        return
     if LIVE_TRADING:
         try:
-            if broker.position_qty(trade.symbol) != 0:
-                raise RuntimeError("same-symbol broker position already exists")
+            verify_live_account_matches_state(broker, state)
             for payload in broker.orders():
                 snapshot = OrderSnapshot.from_payload(payload)
                 if (
@@ -3760,19 +4973,69 @@ def execute_trade(
             )
             return
 
+    # Account calls above can consume the remaining entry window or portfolio
+    # budget. This second check is the authoritative pre-mutation gate.
+    if not entry_window_open():
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason="ENTRY_CUTOFF_AFTER_PREFLIGHT",
+        )
+        return
+    admitted, admission_reason = assess_trade_admission(state, trade)
+    if not admitted:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=admission_reason,
+        )
+        return
+
     trade.ai_decision = ai_decision.decision if AI_MODE != "off" else "OFF"
-    trade.requested_qty = trade.requested_qty or trade.qty
     trade.entry_tag = new_order_tag("ENT")
+    trade.stop_tag = new_order_tag("STP")
     trade.status = "ENTRY_INTENT"
-    persist_trade(state, trade)
-    journal(
-        "ORDER_INTENT",
-        role="ENTRY",
-        symbol=trade.symbol,
-        side=trade.side,
-        qty=trade.requested_qty,
-        tag=trade.entry_tag,
-    )
+    try:
+        persist_trade(state, trade)
+        journal(
+            "ORDER_INTENT",
+            role="ENTRY",
+            symbol=trade.symbol,
+            side=trade.side,
+            qty=trade.requested_qty,
+            tag=trade.entry_tag,
+            reserved_risk=trade.reserved_risk_amount,
+            planned_stop_tag=trade.stop_tag,
+        )
+    except Exception as exc:
+        halt_trading(
+            state,
+            f"{trade.symbol}: durable entry intent failed before submission: {exc}",
+        )
+        return
+
+    # Durable telemetry above can cross the guarded cutoff. No broker mutation
+    # is allowed after that boundary, even though an entry intent exists.
+    if not entry_window_open():
+        trade.status = "ABORTED"
+        trade.reserved_risk_amount = 0.0
+        try:
+            persist_trade(state, trade)
+        except Exception as exc:
+            halt_trading(
+                state,
+                f"{trade.symbol}: cutoff-abort persistence failed: {exc}",
+            )
+            return
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason="ENTRY_CUTOFF_AFTER_INTENT",
+        )
+        return
 
     if LIVE_TRADING:
         transaction = "BUY" if trade.side == "LONG" else "SELL"
@@ -3796,6 +5059,7 @@ def execute_trade(
             entry = broker.wait_for_order(
                 trade.entry_order_id,
                 timeout_seconds=ENTRY_FILL_TIMEOUT_SECONDS,
+                return_on_partial=True,
             )
             if not entry.terminal:
                 entry = broker.cancel_order_confirmed(
@@ -3809,9 +5073,10 @@ def execute_trade(
             trade.entry_status = entry.status
             if entry.filled <= 0:
                 trade.qty = 0
+                trade.reserved_risk_amount = 0.0
                 trade.status = "ABORTED"
                 persist_trade(state, trade)
-                journal(
+                journal_best_effort(
                     "ENTRY_ABORTED",
                     symbol=trade.symbol,
                     order_id=trade.entry_order_id,
@@ -3827,17 +5092,14 @@ def execute_trade(
             if actual_entry <= 0:
                 raise RuntimeError("confirmed entry fill has no execution price")
         except Exception as exc:
-            trade.status = "HALTED_UNCERTAIN"
-            persist_trade(state, trade)
-            halt_trading(
-                state,
-                f"{trade.symbol} entry state uncertain: {type(exc).__name__}: {exc}",
-            )
-            close_trade_market(
+            fail_safe_trade_lifecycle(
                 broker,
                 state,
-                trade.symbol,
-                "ENTRY_FAILURE",
+                trade,
+                f"{trade.symbol} entry state uncertain: {type(exc).__name__}: {exc}",
+                unresolved_order_intent=bool(
+                    trade.entry_tag and not trade.entry_order_id
+                ),
             )
             return
     else:
@@ -3850,14 +5112,57 @@ def execute_trade(
         )
 
     update_prices_from_entry(trade, inst, actual_entry)
-    if trade.requested_qty > 0 and trade.qty < trade.requested_qty:
-        trade.planned_risk_amount *= trade.qty / trade.requested_qty
-    trade.status = "ENTRY_PARTIAL" if trade.qty < trade.requested_qty else "ENTRY_FILLED"
+    refresh_trade_economics_after_fill(trade, inst)
+    actual_admitted, actual_admission_reason = assess_trade_admission(
+        state,
+        trade,
+        exclude_symbol=trade.symbol,
+    )
+    if not actual_admitted:
+        fail_safe_trade_lifecycle(
+            broker,
+            state,
+            trade,
+            (
+                f"{trade.symbol}: actual fill exceeds admission limits: "
+                f"{actual_admission_reason}"
+            ),
+        )
+        return
+    band_ok, band_reason = validate_price_band_geometry(
+        trade.side,
+        trade.stop_price,
+        trade.target_price,
+        setup.lower_circuit_limit,
+        setup.upper_circuit_limit,
+        trade.entry_price,
+        inst.tick_size,
+    )
+    if not band_ok:
+        fail_safe_trade_lifecycle(
+            broker,
+            state,
+            trade,
+            f"{trade.symbol}: actual fill invalidated price band: {band_reason}",
+        )
+        return
+
+    # Persist the complete protection intent before any optional telemetry.
+    trade.status = "STOP_SUBMITTED"
     state["trades_today"] += 1
     if trade.symbol not in state["blocked_symbols"]:
         state["blocked_symbols"].append(trade.symbol)
-    persist_trade(state, trade)
-    journal(
+    try:
+        persist_trade(state, trade)
+    except Exception as exc:
+        fail_safe_trade_lifecycle(
+            broker,
+            state,
+            trade,
+            f"{trade.symbol}: protection intent persistence failed: {exc}",
+        )
+        return
+    journal_best_effort(
         "ENTRY_FILLED",
         symbol=trade.symbol,
         side=trade.side,
@@ -3866,12 +5171,9 @@ def execute_trade(
         entry=trade.entry_price,
         order_id=trade.entry_order_id,
         status=trade.entry_status,
+        reserved_risk=trade.reserved_risk_amount,
     )
-
-    trade.stop_tag = new_order_tag("STP")
-    trade.status = "STOP_SUBMITTED"
-    persist_trade(state, trade)
-    journal(
+    journal_best_effort(
         "ORDER_INTENT",
         role="STOP",
         symbol=trade.symbol,
@@ -3939,17 +5241,17 @@ def execute_trade(
                     f"position_matches={position_matches}"
                 )
         except Exception as exc:
-            trade.status = "HALTED_UNCERTAIN"
-            persist_trade(state, trade)
-            halt_trading(
-                state,
-                f"{trade.symbol} protection failure: {type(exc).__name__}: {exc}",
-            )
-            close_trade_market(
+            fail_safe_trade_lifecycle(
                 broker,
                 state,
-                trade.symbol,
-                "PROTECTION_FAILURE",
+                trade,
+                (
+                    f"{trade.symbol} protection failure: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                unresolved_order_intent=bool(
+                    trade.stop_tag and not trade.stop_order_id
+                ),
             )
             return
     else:
@@ -3957,10 +5259,21 @@ def execute_trade(
         trade.stop_status = "TRIGGER PENDING"
 
     trade.status = "OPEN_PROTECTED"
-    persist_trade(state, trade)
-    journal(
+    try:
+        persist_trade(state, trade)
+    except Exception as exc:
+        fail_safe_trade_lifecycle(
+            broker,
+            state,
+            trade,
+            f"{trade.symbol}: protected-state persistence failed: {exc}",
+        )
+        return
+    journal_best_effort(
         "OPEN",
         symbol=trade.symbol,
+        idea_id=trade.idea_id,
+        ai_review_idea_id=trade.ai_review_idea_id,
         side=trade.side,
         qty=trade.qty,
         entry=trade.entry_price,
@@ -3969,13 +5282,22 @@ def execute_trade(
         entry_order_id=trade.entry_order_id,
         stop_order_id=trade.stop_order_id,
         technical_score=setup.technical_score,
-        ai_mode=AI_MODE,
+        ai_mode=trade.ai_mode or AI_MODE,
         ai_decision=trade.ai_decision,
         ai_valid=trade.ai_valid,
         ai_error=trade.ai_error,
         ai_response_model=trade.ai_response_model,
         ai_response_id=trade.ai_response_id,
         ai_prompt_version=trade.ai_prompt_version,
+        ai_decision_id=trade.ai_decision_id,
+        ai_input_sha256=trade.ai_input_sha256,
+        ai_input_tokens=trade.ai_input_tokens,
+        ai_output_tokens=trade.ai_output_tokens,
+        ai_total_tokens=trade.ai_total_tokens,
+        planned_risk=trade.planned_risk_amount,
+        reserved_risk=trade.reserved_risk_amount,
+        planned_target_profit=trade.planned_target_profit_amount,
+        planned_after_cost_payoff=trade.planned_after_cost_payoff,
         ai_confidence=ai_decision.confidence,
         ai_quality=ai_decision.quality_score,
         ai_reason=ai_decision.reason,
@@ -3993,6 +5315,18 @@ def monitor_open_trades(
     for symbol, data in list(state["trades"].items()):
         trade = trade_from_dict(data)
         if trade.status != "OPEN_PROTECTED":
+            if str(trade.status).upper() in ACTIVE_TRADE_STATUSES:
+                halt_trading(
+                    state,
+                    f"{symbol}: runtime recovery required for {trade.status}",
+                )
+                if LIVE_TRADING:
+                    close_trade_market(
+                        broker,
+                        state,
+                        symbol,
+                        "RUNTIME_LIFECYCLE_RECOVERY",
+                    )
             continue
         if LIVE_TRADING:
             qty_now = broker.position_qty(symbol)
@@ -4023,7 +5357,19 @@ def monitor_open_trades(
                     trade.accounting_note = (
                         "broker position quantity changed outside the tracked lifecycle"
                     )
-                    persist_trade(state, trade)
+                    try:
+                        persist_trade(state, trade)
+                    except Exception as exc:
+                        halt_trading(
+                            state,
+                            f"{symbol}: protection-loss state persistence failed: {exc}",
+                        )
+                        emergency_flatten_without_state(
+                            broker,
+                            trade,
+                            "PROTECTION_LOSS_PERSISTENCE_FAILURE",
+                        )
+                        continue
                 halt_trading(
                     state,
                     f"{symbol}: live position is no longer exactly protected",
@@ -4094,13 +5440,11 @@ def flatten_all(
                 success = False
                 log(f"CRITICAL flatten failure {symbol}: {exc}")
     if LIVE_TRADING:
-        remaining = [
-            str(p.get("tradingsymbol"))
-            for p in broker.positions()
-            if p.get("exchange") == "NSE"
-            and p.get("product") == "MIS"
-            and int(safe_float(p.get("quantity"))) != 0
-        ]
+        remaining = sorted(
+            symbol
+            for symbol, quantity in broker_mis_position_quantities(broker).items()
+            if quantity != 0
+        )
         if remaining:
             success = False
             halt_trading(
@@ -4110,12 +5454,58 @@ def flatten_all(
     return success
 
 
+def enforce_daily_pnl_limit(broker: KiteBroker, state: dict) -> None:
+    """Fail closed when authoritative daily P&L is unavailable or breached."""
+    try:
+        pnl = (
+            broker.current_intraday_pnl()
+            if LIVE_TRADING
+            else strict_finite_float(
+                state.get("realized_pnl"),
+                field="state.realized_pnl",
+            )
+        )
+    except Exception as exc:
+        halt_trading(
+            state,
+            f"authoritative daily P&L unavailable: {type(exc).__name__}: {exc}",
+        )
+        if open_trade_count(state) > 0:
+            flatten_all(broker, state, "PNL_DATA_UNAVAILABLE")
+        return
+
+    if pnl <= -(CAPITAL_LIMIT * MAX_DAILY_LOSS_PCT):
+        log(f"DAILY LOSS LIMIT reached: ₹{pnl:,.2f}")
+        halt_trading(state, "daily loss limit reached")
+        flatten_all(broker, state, "DAILY_LOSS_LIMIT")
+
+
 def reconcile_startup(
     broker: KiteBroker,
     state: dict,
 ) -> None:
     """Reconcile positions and protection before the event loop accepts work."""
     if not LIVE_TRADING:
+        real_positions = sorted(
+            symbol
+            for symbol, quantity in broker_mis_position_quantities(broker).items()
+            if quantity != 0
+        )
+        active_bot_orders: list[str] = []
+        for payload in broker.orders():
+            snapshot = OrderSnapshot.from_payload(payload)
+            if not snapshot.terminal and is_generated_order_tag(snapshot.tag):
+                active_bot_orders.append(snapshot.order_id)
+        if real_positions or active_bot_orders:
+            details = []
+            if real_positions:
+                details.append("positions=" + ",".join(real_positions))
+            if active_bot_orders:
+                details.append("orders=" + ",".join(active_bot_orders))
+            raise RuntimeError(
+                "Paper mode found real bot/account exposure; authenticated live "
+                "reconciliation is required (" + "; ".join(details) + ")"
+            )
         return
     tracked = {
         symbol
@@ -4123,11 +5513,9 @@ def reconcile_startup(
         if str(trade.get("status", "")).upper() in ACTIVE_TRADE_STATUSES
     }
     positions = {
-        str(p.get("tradingsymbol")): int(safe_float(p.get("quantity")))
-        for p in broker.positions()
-        if p.get("exchange") == "NSE"
-        and p.get("product") == "MIS"
-        and int(safe_float(p.get("quantity"))) != 0
+        symbol: quantity
+        for symbol, quantity in broker_mis_position_quantities(broker).items()
+        if quantity != 0
     }
     untracked = sorted(set(positions) - tracked)
     if untracked:
@@ -4220,11 +5608,9 @@ def reconcile_startup(
     # A cancellation can race a fill. Re-fetch after every orphan mutation
     # before deciding startup is safe.
     positions = {
-        str(p.get("tradingsymbol")): int(safe_float(p.get("quantity")))
-        for p in broker.positions()
-        if p.get("exchange") == "NSE"
-        and p.get("product") == "MIS"
-        and int(safe_float(p.get("quantity"))) != 0
+        symbol: quantity
+        for symbol, quantity in broker_mis_position_quantities(broker).items()
+        if quantity != 0
     }
     untracked_after_cancels = sorted(set(positions) - tracked)
     if untracked_after_cancels:
@@ -4355,6 +5741,8 @@ def scan_for_new_trades(
     ai: AIFilter | None,
     state: dict,
 ) -> None:
+    if not entry_window_open():
+        return
     if (
         state["trades_today"]
         >= MAX_TRADES_PER_DAY
@@ -4405,6 +5793,8 @@ def scan_for_new_trades(
     qualified: list[Setup] = []
 
     for quote in candidates:
+        if not entry_window_open():
+            break
         if (
             state["trades_today"]
             >= MAX_TRADES_PER_DAY
@@ -4418,6 +5808,8 @@ def scan_for_new_trades(
             break
 
         try:
+            if open_trade_count(state) > 0:
+                monitor_open_trades(broker, state)
             df = broker.strategy_candles(
                 quote.token
             )
@@ -4458,10 +5850,10 @@ def scan_for_new_trades(
         return
 
     qualified.sort(
-        key=lambda x: x.technical_score,
-        reverse=True,
+        key=lambda x: (-x.technical_score, x.signal_at, x.symbol),
     )
 
+    ai_reviews_used = 0
     for setup in qualified:
         if (
             state["trades_today"]
@@ -4473,6 +5865,14 @@ def scan_for_new_trades(
             open_trade_count(state)
             >= MAX_OPEN_POSITIONS
         ):
+            break
+        if not entry_window_open():
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason="ENTRY_CUTOFF_DURING_SCAN",
+            )
             break
 
         log(
@@ -4486,6 +5886,65 @@ def scan_for_new_trades(
             f"Spread={setup.spread_bps:.1f}bps"
         )
 
+        refreshed_setup, refresh_reason = revalidate_live_setup(
+            broker,
+            setup,
+        )
+        if refreshed_setup is None:
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason=refresh_reason,
+            )
+            log(f"{setup.symbol}: live revalidation rejected: {refresh_reason}")
+            continue
+        setup = refreshed_setup
+
+        capacity = entry_capacity(state)
+        if not capacity.allowed:
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason=capacity.reason,
+                capacity=asdict(capacity),
+            )
+            break
+        built = build_trade_result(
+            broker,
+            setup,
+            risk_budget=capacity.candidate_risk_budget,
+            notional_budget=capacity.candidate_notional_budget,
+        )
+        if built.trade is None:
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason=built.reason,
+                setup=asdict(setup),
+                outcome=asdict(built.outcome) if built.outcome else None,
+                capacity=asdict(capacity),
+            )
+            continue
+        trade = built.trade
+        review_candidate = build_ai_candidate_payload(setup, trade, capacity)
+        review_idea_id = stable_json_sha256(review_candidate)[:24]
+        if AI_MODE != "off":
+            review_candidate_logged = journal_best_effort(
+                "AI_REVIEW_CANDIDATE",
+                idea_id=review_idea_id,
+                symbol=setup.symbol,
+                side=setup.side,
+                candidate=review_candidate,
+                candidate_sha256=stable_json_sha256(review_candidate),
+                ai_mode=AI_MODE,
+            )
+            if not review_candidate_logged and AI_MODE == "gate":
+                continue
+
+        review_trace: AIFilter | None = None
         if AI_MODE == "off":
             decision = AIDecision(
                 decision="APPROVE",
@@ -4496,14 +5955,26 @@ def scan_for_new_trades(
             )
         elif ai is None:
             decision = AIDecision(
-                decision="REJECT",
-                confidence=100,
+                decision="ERROR",
+                confidence=0,
                 quality_score=0,
                 reason="AI unavailable.",
                 risk_flags=["AI_UNAVAILABLE"],
             )
+        elif ai_reviews_used >= MAX_AI_REVIEWS_PER_SCAN:
+            decision = AIDecision(
+                decision="ERROR",
+                confidence=0,
+                quality_score=0,
+                reason="Per-scan AI review budget exhausted.",
+                risk_flags=["AI_BUDGET_SKIPPED"],
+            )
         else:
-            decision = ai.review(setup)
+            decision = ai.review(
+                identifier_stripped_ai_payload(review_candidate)
+            )
+            ai_reviews_used += 1
+            review_trace = ai
 
         log(
             f"AI {setup.symbol}: "
@@ -4513,8 +5984,10 @@ def scan_for_new_trades(
             f"{decision.reason}"
         )
 
-        journal(
+        review_logged = journal_best_effort(
             "AI_REVIEW",
+            idea_id=review_idea_id,
+            decision_id=getattr(review_trace, "last_decision_id", ""),
             symbol=setup.symbol,
             side=setup.side,
             technical_score=setup.technical_score,
@@ -4525,10 +5998,16 @@ def scan_for_new_trades(
             risk_flags=decision.risk_flags,
             ai_mode=AI_MODE,
             prompt_version=AI_PROMPT_VERSION,
-            response_model=getattr(ai, "last_response_model", ""),
-            response_id=getattr(ai, "last_response_id", ""),
-            latency_ms=getattr(ai, "last_latency_ms", 0),
-            error=getattr(ai, "last_error", ""),
+            response_model=getattr(review_trace, "last_response_model", ""),
+            response_id=getattr(review_trace, "last_response_id", ""),
+            review_status=getattr(review_trace, "last_status", "NOT_RUN"),
+            latency_ms=getattr(review_trace, "last_latency_ms", 0),
+            error=getattr(review_trace, "last_error", ""),
+            input_sha256=getattr(review_trace, "last_input_sha256", ""),
+            input_tokens=getattr(review_trace, "last_input_tokens", 0),
+            output_tokens=getattr(review_trace, "last_output_tokens", 0),
+            total_tokens=getattr(review_trace, "last_total_tokens", 0),
+            setup=asdict(setup),
         )
 
         if (
@@ -4537,16 +6016,26 @@ def scan_for_new_trades(
                 decision.decision != "APPROVE"
                 or decision.confidence < AI_MIN_CONFIDENCE
                 or decision.quality_score < 75
+                or not review_logged
             )
         ):
             continue
 
-        refreshed_setup, refresh_reason = revalidate_live_setup(
+        if not entry_window_open():
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason="ENTRY_CUTOFF_AFTER_AI",
+            )
+            break
+
+        final_setup, refresh_reason = revalidate_live_setup(
             broker,
             setup,
         )
-        if refreshed_setup is None:
-            journal(
+        if final_setup is None:
+            journal_best_effort(
                 "SIGNAL_REJECTED",
                 symbol=setup.symbol,
                 side=setup.side,
@@ -4554,26 +6043,78 @@ def scan_for_new_trades(
             )
             log(f"{setup.symbol}: live revalidation rejected: {refresh_reason}")
             continue
-        setup = refreshed_setup
+        setup = final_setup
 
-        trade = build_trade(
+        final_capacity = entry_capacity(state)
+        if not final_capacity.allowed:
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason=final_capacity.reason,
+                capacity=asdict(final_capacity),
+            )
+            break
+        rebuilt = build_trade_result(
             broker,
             setup,
+            risk_budget=final_capacity.candidate_risk_budget,
+            notional_budget=final_capacity.candidate_notional_budget,
         )
-
-        if trade is None:
+        if rebuilt.trade is None:
+            journal_best_effort(
+                "SIGNAL_REJECTED",
+                symbol=setup.symbol,
+                side=setup.side,
+                reason=rebuilt.reason,
+                outcome=asdict(rebuilt.outcome) if rebuilt.outcome else None,
+            )
             continue
+        final_trade = rebuilt.trade
+        trade = final_trade
+
+        final_candidate = build_ai_candidate_payload(
+            setup,
+            trade,
+            final_capacity,
+        )
+        trade.idea_id = stable_json_sha256(final_candidate)[:24]
+        trade.ai_review_idea_id = review_idea_id
+        should_log_ai_candidate = (
+            AI_MODE != "off" or AI_IDEA_MODE == "shadow"
+        )
+        if should_log_ai_candidate:
+            candidate_logged = journal_best_effort(
+                "AI_CANDIDATE",
+                idea_id=trade.idea_id,
+                ai_review_idea_id=review_idea_id,
+                symbol=setup.symbol,
+                side=setup.side,
+                candidate=final_candidate,
+                candidate_sha256=stable_json_sha256(final_candidate),
+                idea_mode=AI_IDEA_MODE,
+            )
+            if not candidate_logged and AI_MODE == "gate":
+                continue
 
         trade.ai_mode = AI_MODE
         trade.ai_valid = bool(
             AI_MODE in {"shadow", "gate"}
-            and ai is not None
-            and not ai.last_error
+            and review_trace is not None
+            and not getattr(review_trace, "last_error", "")
+            and decision.decision in {"APPROVE", "REJECT"}
         )
-        trade.ai_error = getattr(ai, "last_error", "")
-        trade.ai_response_model = getattr(ai, "last_response_model", "")
-        trade.ai_response_id = getattr(ai, "last_response_id", "")
+        trade.ai_error = getattr(review_trace, "last_error", "")
+        if decision.decision == "ERROR" and not trade.ai_error:
+            trade.ai_error = decision.reason
+        trade.ai_response_model = getattr(review_trace, "last_response_model", "")
+        trade.ai_response_id = getattr(review_trace, "last_response_id", "")
         trade.ai_prompt_version = AI_PROMPT_VERSION
+        trade.ai_decision_id = getattr(review_trace, "last_decision_id", "")
+        trade.ai_input_sha256 = getattr(review_trace, "last_input_sha256", "")
+        trade.ai_input_tokens = getattr(review_trace, "last_input_tokens", 0)
+        trade.ai_output_tokens = getattr(review_trace, "last_output_tokens", 0)
+        trade.ai_total_tokens = getattr(review_trace, "last_total_tokens", 0)
 
         execute_trade(
             broker,
@@ -4629,6 +6170,11 @@ def _run_main() -> None:
         state = load_state()
         broker = KiteBroker()
         reconcile_startup(broker, state)
+        journal(
+            "SESSION_START",
+            manifest=RUNTIME_MANIFEST,
+            manifest_sha256=stable_json_sha256(RUNTIME_MANIFEST),
+        )
         ai = (
             AIFilter()
             if AI_MODE != "off" and OPENAI_API_KEY
@@ -4723,35 +6269,7 @@ def _run_main() -> None:
                 and monotonic_now
                 >= next_pnl_check
             ):
-                try:
-                    pnl = (
-                        broker.current_intraday_pnl()
-                        if LIVE_TRADING
-                        else safe_float(state.get("realized_pnl"))
-                    )
-
-                    if pnl <= -(
-                        CAPITAL_LIMIT
-                        * MAX_DAILY_LOSS_PCT
-                    ):
-                        log(
-                            "DAILY LOSS LIMIT "
-                            f"reached: ₹{pnl:,.2f}"
-                        )
-
-                        halt_trading(state, "daily loss limit reached")
-
-                        flatten_all(
-                            broker,
-                            state,
-                            "DAILY_LOSS_LIMIT",
-                        )
-
-                except Exception as exc:
-                    log(
-                        f"Daily P&L check error: "
-                        f"{exc}"
-                    )
+                enforce_daily_pnl_limit(broker, state)
 
                 next_pnl_check = (
                     monotonic_now + 10
@@ -4783,10 +6301,7 @@ def _run_main() -> None:
                 time.sleep(2)
                 continue
 
-            entry_window = (
-                current >= SIGNAL_START
-                and current < LAST_ENTRY
-            )
+            entry_window = entry_window_open(now)
 
             if (
                 entry_window

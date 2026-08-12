@@ -1,4 +1,4 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.1
+# Zerodha Kite + GPT AI Intraday Bot V3.2
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
@@ -25,14 +25,17 @@ top candidate pool → historical 5-minute candles
         ↓
 causal ORB/VWAP/EMA/RSI/ATR/RVOL rules
         ↓
-AI_MODE=off | shadow | gate
+initial live revalidation + after-cost/risk checks
         ↓
-hard position and daily risk limits
+AI_MODE=off | synchronous online shadow/gate review
+        ↓
+final live revalidation + trade rebuild + capacity reservation
+        ↘ append-only AI_CANDIDATE record → offline ai_ideas.py
         ↓
 paper execution or guarded MIS order workflow
 ```
 
-V3.1 shards the dynamic NSE EQ universe across up to three WebSocket
+V3.2 shards the dynamic NSE EQ universe across up to three WebSocket
 connections. The default is 2,800 instruments per socket, below Kite's
 documented 3,000-instrument limit. All sockets update one thread-safe tick
 store; no fixed watchlist is required.
@@ -51,13 +54,16 @@ Create `.env` from the template only if you do not already have one:
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 ```
 
-Set the Kite credentials and, for `shadow` or `gate`, an OpenAI API key. Keep
-these safety values unchanged:
+Set the Kite credentials. Add an OpenAI API key only when deliberately running
+the offline idea worker or an online `shadow`/`gate` experiment. Keep these
+recommended research-safety values unchanged:
 
 ```dotenv
-AI_MODE=shadow
+AI_MODE=off
+AI_IDEA_MODE=shadow
 LIVE_TRADING=false
 LIVE_TRADING_CONFIRM=
 ```
@@ -74,20 +80,61 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 
 ## AI modes
 
-`AI_MODE=shadow` is the research default and is deliberately incompatible with
-live trading.
+The template defaults to `AI_MODE=off`. This keeps OpenAI out of the market
+execution loop and preserves the cleanest deterministic paper baseline.
 
 | Mode | Behavior | Intended use |
 | --- | --- | --- |
-| `off` | Does not call OpenAI; records the deterministic baseline as `OFF`. | Baseline measurement and an explicit non-AI live candidate after promotion. |
-| `shadow` | Records GPT's `APPROVE`/`REJECT` review but does not let it block an otherwise valid paper trade. | Measure incremental AI value against the same deterministic candidates. |
-| `gate` | Requires GPT approval and configured confidence/quality thresholds. Errors fail closed as rejection. | Experimental paper use; live only after separate evidence of after-cost improvement. |
+| `off` | Makes no execution-loop OpenAI call and records the deterministic baseline as `OFF`. | Default paper measurement. |
+| `shadow` | Calls OpenAI synchronously. The label is not a direct veto, but latency can cross the entry cutoff or change final revalidation. | Timing-sensitive paper experiment, not an execution-neutral baseline. |
+| `gate` | Calls OpenAI synchronously and requires approval plus configured thresholds; errors fail closed. | Experimental paper use only. |
+
+Online reviews are capped by `MAX_AI_REVIEWS_PER_SCAN`. Successful API reviews
+record an input hash, decision ID, actual response model/ID, latency, and basic
+token counts. Skipped, unavailable, or failed reviews record `ERROR` and a
+status/reason, but provider response metadata may be blank and usage may be
+zero. The completed-trade `ERROR` cohort is not a count of every API failure.
 
 AI receives structured candidate features; it does not predict fills or know
 the future. It cannot change quantity, stop distance, maximum position size,
 daily loss limits, maximum open positions, or maximum trades. Prompt changes,
 model changes, and model-version drift must be treated as strategy changes and
 revalidated.
+
+`OPENAI_MODEL=gpt-5.6` is an alias that currently routes to GPT-5.6 Sol; it is
+not a promise that behavior will remain fixed. Use an explicitly pinned model
+snapshot when one is available to the account, retain the actual response model
+in provenance, and never combine changed model/prompt/config cohorts as if they
+were one experiment. See the official
+[GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+
+## Research-only AI trade ideas
+
+After the synchronous mode decision, final live revalidation and final trade
+rebuild, the bot attempts to append an `AI_CANDIDATE` for a cost/risk-qualified,
+capacity-eligible proposal. Its `idea_id` identifies that final payload. This is
+not a complete opportunity tape: entry cutoff, daily-trade, open-position, and
+capacity checks truncate the stream. Generate research labels outside the
+execution loop from an explicit same-session journal:
+
+```bash
+python ai_ideas.py logs/trades_YYYYMMDD.jsonl --dry-run
+python ai_ideas.py logs/trades_YYYYMMDD.jsonl --limit 8
+```
+
+Replace `YYYYMMDD` with the session being reviewed. `AI_IDEA_MODE=shadow` marks
+the intended research posture and prevents live startup, but it does not launch
+the worker; running `ai_ideas.py` is the explicit API action and `--limit`
+controls that invocation.
+
+The dry run displays the identifier-stripped candidate payload without calling
+OpenAI. It is not guaranteed anonymous and is not the complete API request. A
+normal run writes owner-only `logs/ai_ideas.jsonl`. The worker removes the
+symbol, token, signal timestamp, and composite scores from model input, then
+constrains output to `TAKE`, `PASS`, or `ABSTAIN` labels for supplied candidate
+IDs. It cannot place orders or change trade parameters or risk. These are
+research labels only; do not connect them to execution unless a frozen,
+out-of-sample portfolio replay first demonstrates repeatable after-cost value.
 
 ## Authentication and connection checks
 
@@ -112,10 +159,11 @@ validate strategy profitability.
 
 ## Paper operation
 
-Confirm these values before every paper run:
+Confirm these recommended values before every baseline paper run:
 
 ```dotenv
-AI_MODE=shadow
+AI_MODE=off
+AI_IDEA_MODE=shadow
 LIVE_TRADING=false
 LIVE_TRADING_CONFIRM=
 ```
@@ -143,15 +191,19 @@ python performance_report.py 'logs/trades_*.jsonl' --json
 ```
 
 It reports trade count, win rate, net and gross P&L, fees, expectancy, profit
-factor, maximum drawdown, average R, and separate AI `APPROVE`/`REJECT` shadow
-cohorts. `OFF` trades count in overall performance but never in an AI cohort.
+factor, maximum drawdown, average R, and separate AI `APPROVE`, `REJECT`, and
+`ERROR` cohorts. `OFF` trades count overall but never in an AI cohort.
 
 Only `CLOSE` records with explicit finite P&L, fees, and R-multiple fields are
-used. AI attribution must be `APPROVE`, `REJECT`, or `OFF`; a missing decision
+used. AI attribution must be `APPROVE`, `REJECT`, `ERROR`, or `OFF`; a missing decision
 is accepted only when `ai_mode=off`. Missing or legacy data is diagnosed and
 excluded, and values are never reconstructed to make a run appear profitable.
 The command exits nonzero when there are no complete P&L records. This is an
-accounting report, not a leakage-safe backtester.
+accounting report, not a leakage-safe backtester. It reports provenance as
+compatible, mixed, or unverifiable when execution mode, configuration
+fingerprint, response model, or prompt version differ or are missing. The P&L
+aggregate remains calculable for legacy records, but a warning does not make
+mixed experiments comparable or causal.
 
 ## Live-order guard
 
@@ -166,8 +218,9 @@ LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 It also requires an explicit `AI_MODE=off` or `AI_MODE=gate`; `shadow` is
 rejected. The process verifies its public IPv4 against `KITE_STATIC_IP` before
 live broker operation. These are mistake-prevention controls, not evidence that
-the strategy is safe or profitable. Do not set them until every promotion item
-below has independent evidence.
+the strategy is safe, compliant, or profitable. This audit does not approve any
+live deployment: keep live trading off even if the flags can technically be
+satisfied.
 
 ## Promotion checklist
 
@@ -187,10 +240,11 @@ good. Record and review evidence for all of the following:
   with a broad parameter plateau rather than one optimized point.
 - Shadow results show that AI adds repeatable **after-cost** value over the
   exact deterministic baseline. Otherwise use `AI_MODE=off`.
-- A broker-provided sandbox or equivalent isolated execution simulator covers
+- Kite's no-real-money sandbox is used for what it supports, while a separate
+  deterministic local simulator covers MARKET/SL-M behavior, margin paths,
   partial fills, ambiguous submissions, stop or exit rejection, reconnects,
-  process restarts, position reconciliation, orphan-order cleanup, and the
-  end-of-day exit.
+  restarts, reconciliation, orphan cleanup, and end-of-day exit. The repository
+  has not yet demonstrated that complete simulation coverage.
 - Forward paper trading runs long enough to cover ordinary and stressed market
   conditions, with reconciliation against broker-like fills and charges.
 - Deployment checks cover the registered static IP, current broker/exchange
@@ -216,8 +270,13 @@ The deterministic candidate logic uses:
 - no new entries after 14:30 and forced exit at 15:10
 
 Default ceilings for `CAPITAL_LIMIT=100000` are approximately ₹200 planned risk
-per stopped trade, ₹25,000 maximum position notional, two open positions, five
-trades per day, and an ₹800 daily kill level. These are configurable loss
+per stopped trade, ₹25,000 maximum position notional, ₹400 aggregate open-stop
+risk, ₹50,000 aggregate gross exposure, two open positions, five trades per
+day, and an ₹800 daily kill level. Entries use the remaining daily-loss,
+open-stop-risk, and gross-exposure budgets; profits do not expand those limits.
+`MIN_AFTER_COST_PAYOFF_RATIO=1.20` rejects modeled net targets that are too small
+relative to modeled stopped losses. Stops and targets must remain inside the
+directionally relevant circuit with headroom. These are configurable loss
 ceilings, not expected returns. Realized loss can exceed a planned stop because
 of gaps, slippage, rejection, or market dislocation.
 
@@ -227,6 +286,7 @@ of gaps, slippage, rejection, or market dislocation.
 data/bot_state.json   persistent strategy/order state
 data/bot.lock         single-process lock
 logs/trades_YYYYMMDD.jsonl
+logs/ai_ideas.jsonl         offline structured AI research output
 ```
 
 State writes are atomic and the lock prevents two local bot processes from
@@ -242,13 +302,24 @@ normal NSE cash equities while excluding identifiable special or
 compulsory-delivery series. Zerodha can still apply changing RMS and product
 restrictions; a rejected entry must remain no position.
 
-The design assumes Kite limits used by this version: up to 3,000 instruments
-per WebSocket connection, 500 instruments per full-quote request, quote REST at
-1 request/second, historical candles at 3 requests/second, and API orders at 10
-requests/second. It uses automatic market protection for MARKET and SL-M
-orders. Broker and exchange rules can change, so verify the current official
-documentation before any live-readiness review. Realtime WebSocket and
-historical candle access require the appropriate paid Kite Connect plan.
+The bot intentionally limits its preliminary pool to 250 instruments so one
+full-quote request remains comfortably bounded; 250 is this bot's safety cap,
+not a claim about Kite's endpoint maximum. The design also assumes up to 3,000
+instruments per WebSocket connection, quote REST at 1 request/second,
+historical candles at 3 requests/second, and API orders at 10 requests/second.
+It requests automatic market protection for MARKET and SL-M orders. Broker and
+exchange rules can change, so verify the current official documentation before
+every readiness review. Realtime WebSocket and historical candle access require
+the appropriate paid Kite Connect plan.
+
+The Closing Auction Session (CAS) for eligible equity-cash securities took
+effect on 2026-08-03. This bot's configured 15:10 forced exit precedes CAS, but
+CAS changes closing-price and end-of-session data semantics. Historical data,
+recorders, manifests, and replays must version the applicable exchange-session
+regime and must not mix pre-CAS and post-CAS assumptions silently. See the
+[SEBI CAS circular](https://www.sebi.gov.in/legal/circulars/jan-2026/introduction-of-closing-auction-session-cas-in-the-equity-cash-segment-and-certain-modifications-in-the-pre-open-auction-session_99122.html)
+and the
+[NSE Clearing effective-date circular](https://nsearchives.nseindia.com/content/circulars/CMPT74898.pdf).
 
 See [RESEARCH_NOTES.md](RESEARCH_NOTES.md) for the architecture's design
 rationale.

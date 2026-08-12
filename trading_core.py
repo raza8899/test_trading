@@ -62,6 +62,38 @@ def _nonnegative_float(value: Any, *, field: str, default: float = 0.0) -> float
     return number
 
 
+def strict_finite_float(value: Any, *, field: str) -> float:
+    """Parse a broker-critical finite number without permissive defaults.
+
+    Market-data ranking can reasonably skip incomplete observations, but
+    positions, P&L and fills must never turn malformed broker payloads into a
+    synthetic zero.  Keep this helper public so every broker reconciliation
+    path uses the same fail-closed parser.
+    """
+    if isinstance(value, bool) or value in (None, ""):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be a finite number")
+    return number
+
+
+def strict_integral(value: Any, *, field: str) -> int:
+    """Parse a signed broker quantity without rounding or defaulting."""
+    if isinstance(value, bool) or value in (None, ""):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        number = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError(f"{field} must be an integer")
+    return int(number)
+
+
 @dataclass(frozen=True, slots=True)
 class OrderSnapshot:
     """Immutable, normalised view of a Kite order/order-update payload."""
@@ -525,4 +557,3 @@ def directional_slippage_bps(
         transaction_type,
     )
     return per_share / expected * Decimal("10000")
-

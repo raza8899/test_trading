@@ -174,6 +174,160 @@ class PerformanceReportTests(unittest.TestCase):
             self.assertEqual(report["ai_shadow_cohorts"]["APPROVE"]["trades"], 0)
             self.assertEqual(report["ai_shadow_cohorts"]["REJECT"]["trades"], 0)
 
+    def test_ai_errors_are_reported_separately_from_model_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": -7,
+                        "gross_pnl": -5,
+                        "fees": 2,
+                        "r_multiple": -0.1,
+                        "ai_decision": "ERROR",
+                    },
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 3,
+                        "gross_pnl": 4,
+                        "fees": 1,
+                        "r_multiple": 0.05,
+                        "ai_decision": "REJECT",
+                    },
+                ],
+            )
+
+            report = performance_report.build_report([path])
+
+            self.assertEqual(report["summary"]["trades"], 2)
+            self.assertEqual(report["ai_shadow_cohorts"]["ERROR"]["trades"], 1)
+            self.assertEqual(report["ai_shadow_cohorts"]["ERROR"]["net_pnl"], -7)
+            self.assertEqual(report["ai_shadow_cohorts"]["REJECT"]["trades"], 1)
+
+    def test_complete_provenance_is_parsed_and_marked_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 12,
+                        "gross_pnl": 14,
+                        "fees": 2,
+                        "r_multiple": 0.6,
+                        "ai_decision": "APPROVE",
+                        "ai_mode": "SHADOW",
+                        "execution_mode": "PAPER",
+                        "config_fingerprint": "config-a",
+                        "ai_response_model": "gpt-test-1",
+                        "ai_prompt_version": "prompt-v1",
+                    }
+                ],
+            )
+
+            records, diagnostics = performance_report.parse_trade_files([path])
+            report = performance_report.build_report([path])
+
+            self.assertEqual(diagnostics.complete_close_events, 1)
+            self.assertEqual(records[0].execution_mode, "paper")
+            self.assertEqual(records[0].config_fingerprint, "config-a")
+            self.assertEqual(records[0].ai_mode, "shadow")
+            self.assertEqual(records[0].ai_response_model, "gpt-test-1")
+            self.assertEqual(records[0].ai_prompt_version, "prompt-v1")
+            self.assertEqual(report["provenance"]["compatibility_status"], "compatible")
+            self.assertEqual(report["provenance"]["ai"]["compatibility_status"], "compatible")
+            self.assertEqual(report["warnings"], [])
+
+    def test_mixed_experiment_provenance_is_not_presented_as_comparable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            base = {
+                "event": "CLOSE",
+                "gross_pnl": 11,
+                "fees": 1,
+                "r_multiple": 0.5,
+                "ai_decision": "APPROVE",
+            }
+            write_jsonl(
+                path,
+                [
+                    {
+                        **base,
+                        "net_pnl": 10,
+                        "execution_mode": "paper",
+                        "config_fingerprint": "config-a",
+                        "ai_response_model": "gpt-test-1",
+                        "ai_prompt_version": "prompt-v1",
+                    },
+                    {
+                        **base,
+                        "net_pnl": -5,
+                        "execution_mode": "live",
+                        "config_fingerprint": "config-b",
+                        "ai_response_model": "gpt-test-2",
+                        "ai_prompt_version": "prompt-v2",
+                    },
+                ],
+            )
+
+            report = performance_report.build_report([path])
+            provenance = report["provenance"]
+
+            self.assertEqual(report["summary"]["trades"], 2)
+            self.assertEqual(provenance["compatibility_status"], "incompatible_mixed")
+            self.assertFalse(provenance["compatible"])
+            self.assertEqual(provenance["execution_modes"], {"live": 1, "paper": 1})
+            self.assertEqual(
+                provenance["config_fingerprints"],
+                {"config-a": 1, "config-b": 1},
+            )
+            self.assertEqual(
+                provenance["ai"]["compatibility_status"],
+                "incompatible_mixed",
+            )
+            self.assertTrue(
+                any("mixed execution modes" in warning for warning in report["warnings"])
+            )
+            self.assertTrue(
+                any("mixed config fingerprints" in warning for warning in report["warnings"])
+            )
+            self.assertTrue(
+                any("mixed response models" in warning for warning in report["warnings"])
+            )
+            self.assertIn("Provenance compatibility: incompatible_mixed", performance_report.format_text_report(report))
+
+    def test_complete_legacy_records_remain_calculable_but_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_legacy.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 8,
+                        "gross_pnl": 10,
+                        "fees": 2,
+                        "r_multiple": 0.4,
+                        "ai_decision": "APPROVE",
+                    }
+                ],
+            )
+
+            report = performance_report.build_report([path])
+            provenance = report["provenance"]
+
+            self.assertEqual(report["summary"]["trades"], 1)
+            self.assertEqual(report["summary"]["net_pnl"], 8)
+            self.assertEqual(provenance["compatibility_status"], "unverified")
+            self.assertEqual(provenance["missing_execution_mode"], 1)
+            self.assertEqual(provenance["missing_config_fingerprint"], 1)
+            self.assertTrue(
+                any("legacy P&L remains included" in warning for warning in report["warnings"])
+            )
+
     def test_missing_or_unknown_ai_decision_is_not_inferred_outside_off_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trades_20260811.jsonl"
