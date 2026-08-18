@@ -2733,7 +2733,7 @@ def detect_setup(
     if rvol_value < MIN_RVOL:
         return None
 
-    if body_ratio < 0.42:
+    if body_ratio < 0.35:
         return None
 
     long_fresh = (
@@ -2771,9 +2771,9 @@ def detect_setup(
             <= MAX_BREAKOUT_DISTANCE_ATR
         and price > vwap
         and ema9 > ema20
-        and 54 <= rsi_value <= 73
-        and close_location >= 0.68
-        and quote.pct_change >= 0.40
+        and 52 <= rsi_value <= 75
+        and close_location >= 0.60
+        and quote.pct_change >= 0.35
         and nifty_regime != "BEAR"
     )
 
@@ -2784,9 +2784,9 @@ def detect_setup(
             <= MAX_BREAKOUT_DISTANCE_ATR
         and price < vwap
         and ema9 < ema20
-        and 27 <= rsi_value <= 46
-        and close_location <= 0.32
-        and quote.pct_change <= -0.40
+        and 28 <= rsi_value <= 48
+        and close_location <= 0.40
+        and quote.pct_change <= -0.25
         and nifty_regime != "BULL"
     )
 
