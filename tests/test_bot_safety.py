@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import threading
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -1369,3 +1370,369 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProductionOrderRecoveryRegressionTests(IsolatedBotTestCase):
+    def test_aeroflex_pattern_trigger_pending_is_valid_when_exact_order_id_known(self) -> None:
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.symbol = "AEROFLEX"
+        trade.qty = 44
+        trade.requested_qty = 44
+        trade.stop_price = 489.30
+        trade.stop_order_id = "260821190570620"
+        trade.stop_tag = "AISTPLOCALTAG01"
+        instrument = bot.Instrument("AEROFLEX", "Aeroflex", 123, 0.05)
+        # Reproduces the production symptom: broker order is armed and exactly
+        # covers the position, but an authoritative payload can omit the tag.
+        stop = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "260821190570620",
+                "status": "TRIGGER PENDING",
+                "quantity": 44,
+                "filled_quantity": 0,
+                "pending_quantity": 44,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "AEROFLEX",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": "",
+                "trigger_price": 489.30,
+            }
+        )
+
+        self.assertTrue(stop.stop_armed)
+        self.assertTrue(bot.stop_identity_matches(stop, trade, 44, instrument))
+        self.assertTrue(bot.stop_exactly_protects(stop, trade, 44, instrument))
+        self.assertEqual(bot.stop_identity_mismatches(stop, trade, 44, instrument), [])
+
+    def test_duplicate_websocket_order_updates_are_idempotent(self) -> None:
+        broker = object.__new__(bot.KiteBroker)
+        broker._order_condition = threading.Condition()
+        broker._order_updates = {}
+        payload = {
+            "order_id": "OID-1",
+            "status": "TRIGGER PENDING",
+            "quantity": 10,
+            "filled_quantity": 0,
+            "pending_quantity": 10,
+            "transaction_type": "SELL",
+            "order_type": "SL-M",
+            "tradingsymbol": "INFY",
+            "exchange": "NSE",
+            "product": "MIS",
+            "tag": "AISTP000000000001",
+            "trigger_price": 98.0,
+        }
+
+        self.assertTrue(broker._record_order_update(payload))
+        self.assertFalse(broker._record_order_update(dict(payload)))
+        self.assertEqual(len(broker._order_updates), 1)
+
+    def test_latest_order_prefers_full_orderbook_over_sparse_history(self) -> None:
+        broker = object.__new__(bot.KiteBroker)
+        broker._order_condition = threading.Condition()
+        broker._order_updates = {}
+        broker.kite = mock.Mock()
+        broker.kite.orders.return_value = [
+            {
+                "order_id": "STOP-1",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "filled_quantity": 0,
+                "pending_quantity": 10,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": "AISTP000000000001",
+                "trigger_price": 98.0,
+            }
+        ]
+        broker.kite.order_history.return_value = [
+            {
+                "order_id": "STOP-1",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "pending_quantity": 10,
+                "tag": "",
+            }
+        ]
+
+        snapshot = broker.latest_order("STOP-1")
+
+        self.assertEqual(snapshot.tag, "AISTP000000000001")
+        self.assertEqual(snapshot.symbol, "INFY")
+        self.assertTrue(snapshot.stop_armed)
+        broker.kite.order_history.assert_not_called()
+
+    def _dedicated_broker(self, *, stop_fills_on_cancel: bool = False):
+        broker = FakeBroker(signed_qty=10)
+        broker._active_orders = [
+            {
+                "order_id": "UNKNOWN-STOP",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "filled_quantity": 0,
+                "pending_quantity": 10,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": "",
+                "trigger_price": 98.0,
+            }
+        ]
+        broker.orders = mock.Mock(side_effect=lambda: list(broker._active_orders))
+        broker.latest_order = mock.Mock(
+            side_effect=lambda order_id: bot.OrderSnapshot.from_payload(
+                next(row for row in broker._active_orders if row["order_id"] == order_id)
+            )
+        )
+
+        def cancel(order_id, *, timeout_seconds=8):
+            row = next(row for row in broker._active_orders if row["order_id"] == order_id)
+            broker.cancel_calls.append(order_id)
+            if stop_fills_on_cancel:
+                broker.signed_qty = 0
+                terminal_status = "COMPLETE"
+                filled = row["quantity"]
+            else:
+                terminal_status = "CANCELLED"
+                filled = 0
+            broker._active_orders[:] = [
+                item for item in broker._active_orders if item["order_id"] != order_id
+            ]
+            return bot.OrderSnapshot.from_payload(
+                {
+                    **row,
+                    "status": terminal_status,
+                    "filled_quantity": filled,
+                    "pending_quantity": 0,
+                    "average_price": 99.0 if filled else 0.0,
+                }
+            )
+
+        broker.cancel_order_confirmed = mock.Mock(side_effect=cancel)
+
+        def exit_market(inst, signed_qty, tag):
+            broker.exit_calls.append((inst.symbol, signed_qty, tag))
+            broker.signed_qty = 0
+            broker.order_metadata["EXIT-RECOVERY"] = {
+                "symbol": inst.symbol,
+                "exchange": "NSE",
+                "product": "MIS",
+                "transaction_type": "SELL" if signed_qty > 0 else "BUY",
+                "order_type": "MARKET",
+                "tag": tag,
+            }
+            broker.order_snapshots["EXIT-RECOVERY"] = bot.OrderSnapshot.from_payload(
+                {
+                    "order_id": "EXIT-RECOVERY",
+                    "status": "COMPLETE",
+                    "quantity": abs(signed_qty),
+                    "filled_quantity": abs(signed_qty),
+                    "pending_quantity": 0,
+                    "average_price": 99.0,
+                    "transaction_type": "SELL" if signed_qty > 0 else "BUY",
+                    "order_type": "MARKET",
+                    "tradingsymbol": inst.symbol,
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "tag": tag,
+                }
+            )
+            return "EXIT-RECOVERY"
+
+        broker.exit_market = mock.Mock(side_effect=exit_market)
+        broker.wait_for_order = mock.Mock(
+            side_effect=lambda order_id, **kwargs: broker.order_snapshots[order_id]
+        )
+        broker.wait_for_position_qty = mock.Mock(
+            side_effect=lambda symbol, expected_qty, **kwargs: broker.signed_qty == expected_qty
+        )
+        return broker
+
+    def test_dedicated_recovery_cancels_unknown_stop_then_flattens_once(self) -> None:
+        broker = self._dedicated_broker()
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            flat, ids = bot.dedicated_force_flatten_symbol(broker, "INFY", "TEST")
+
+        self.assertTrue(flat)
+        self.assertEqual(ids, ["EXIT-RECOVERY"])
+        self.assertEqual(broker.cancel_calls, ["UNKNOWN-STOP"])
+        self.assertEqual(len(broker.exit_calls), 1)
+        self.assertEqual(broker.signed_qty, 0)
+
+    def test_dedicated_recovery_does_not_double_exit_if_stop_fills_while_canceling(self) -> None:
+        broker = self._dedicated_broker(stop_fills_on_cancel=True)
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            flat, ids = bot.dedicated_force_flatten_symbol(broker, "INFY", "TEST")
+
+        self.assertTrue(flat)
+        self.assertEqual(ids, [])
+        self.assertEqual(broker.exit_calls, [])
+        self.assertEqual(broker.signed_qty, 0)
+
+    def test_dedicated_startup_flattens_untracked_mis_position(self) -> None:
+        broker = self._dedicated_broker()
+        state = bot.fresh_state()
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            bot.reconcile_startup(broker, state)
+
+        self.assertEqual(broker.signed_qty, 0)
+        self.assertEqual(len(broker.exit_calls), 1)
+
+    def test_kill_switch_recovery_stops_mutating_after_retry_cap(self) -> None:
+        broker = FakeBroker(signed_qty=10)
+        state = bot.fresh_state()
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "live"
+        state["trades"][trade.symbol] = asdict(trade)
+        state["kill_switch"] = True
+        state["halt_reason"] = "test halt"
+
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "MAX_KILL_SWITCH_FLATTEN_ATTEMPTS", 2),
+            mock.patch.object(bot, "flatten_all", return_value=False) as flatten,
+        ):
+            self.assertFalse(bot.handle_kill_switch_recovery(broker, state))
+            self.assertFalse(bot.handle_kill_switch_recovery(broker, state))
+            self.assertFalse(bot.handle_kill_switch_recovery(broker, state))
+
+        self.assertEqual(flatten.call_count, 2)
+        self.assertTrue(state["manual_intervention_required"])
+        self.assertIn("automatic flatten recovery exhausted", state["halt_reason"])
+
+
+class DedicatedAccountAdditionalSafetyTests(IsolatedBotTestCase):
+    def test_non_dedicated_startup_still_rejects_unowned_nse_mis_order(self) -> None:
+        broker = FakeBroker()
+        broker.startup_order_payloads = [
+            {
+                "order_id": "MANUAL-1",
+                "status": "TRIGGER PENDING",
+                "quantity": 10,
+                "pending_quantity": 10,
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": "MANUAL",
+                "trigger_price": 98.0,
+            }
+        ]
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unowned active NSE/MIS order"):
+                bot.reconcile_startup(broker, bot.fresh_state())
+
+    def test_dedicated_startup_cancels_unowned_nse_mis_order_when_flat(self) -> None:
+        broker = FakeBroker(signed_qty=0)
+        active = {
+            "order_id": "MANUAL-1",
+            "status": "TRIGGER PENDING",
+            "quantity": 10,
+            "pending_quantity": 10,
+            "transaction_type": "SELL",
+            "order_type": "SL-M",
+            "tradingsymbol": "INFY",
+            "exchange": "NSE",
+            "product": "MIS",
+            "tag": "",
+            "trigger_price": 98.0,
+        }
+        broker.startup_order_payloads = [active]
+        broker.cancel_order_confirmed = mock.Mock(
+            return_value=bot.OrderSnapshot.from_payload(
+                {**active, "status": "CANCELLED", "pending_quantity": 0}
+            )
+        )
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+        ):
+            bot.reconcile_startup(broker, bot.fresh_state())
+
+        broker.cancel_order_confirmed.assert_called_once()
+
+    def test_ambiguous_dedicated_recovery_is_never_resubmitted_in_same_process(self) -> None:
+        broker = FakeBroker(signed_qty=10)
+        broker.orders = mock.Mock(return_value=[])
+        broker._recovery_ambiguous_symbols = set()
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+            mock.patch.object(bot.time, "sleep"),
+            mock.patch.object(
+                bot,
+                "submit_or_recover_order",
+                side_effect=RuntimeError("UNKNOWN broker submission for tag X; do not retry"),
+            ) as submit,
+        ):
+            first, _ = bot.dedicated_force_flatten_symbol(broker, "INFY", "TEST")
+            second, _ = bot.dedicated_force_flatten_symbol(broker, "INFY", "TEST")
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(submit.call_count, 1)
+        self.assertIn("INFY", broker._recovery_ambiguous_symbols)
+
+class DedicatedRecoveryInstrumentFallbackTests(IsolatedBotTestCase):
+    def test_dedicated_recovery_can_flatten_symbol_missing_from_scanner_universe(self) -> None:
+        broker = FakeBroker(signed_qty=10)
+        broker.instrument = mock.Mock(return_value=None)
+        broker.orders = mock.Mock(return_value=[])
+        broker.exit_market = mock.Mock(side_effect=lambda inst, signed_qty, tag: "EXIT-FALLBACK")
+        broker.order_snapshots["EXIT-FALLBACK"] = bot.OrderSnapshot.from_payload(
+            {
+                "order_id": "EXIT-FALLBACK",
+                "status": "COMPLETE",
+                "quantity": 10,
+                "filled_quantity": 10,
+                "pending_quantity": 0,
+                "average_price": 99.0,
+                "transaction_type": "SELL",
+                "order_type": "MARKET",
+                "tradingsymbol": "INFY",
+                "exchange": "NSE",
+                "product": "MIS",
+                "tag": "AIRCVA123456789",
+            }
+        )
+        def wait(order_id, **kwargs):
+            broker.signed_qty = 0
+            return broker.order_snapshots[order_id]
+        broker.wait_for_order = mock.Mock(side_effect=wait)
+        broker.wait_for_position_qty = mock.Mock(
+            side_effect=lambda symbol, expected_qty, **kwargs: broker.signed_qty == expected_qty
+        )
+        with (
+            mock.patch.object(bot, "LIVE_TRADING", True),
+            mock.patch.object(bot, "DEDICATED_BOT_ACCOUNT", True),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            flat, ids = bot.dedicated_force_flatten_symbol(broker, "INFY", "TEST")
+
+        self.assertTrue(flat)
+        self.assertEqual(ids, ["EXIT-FALLBACK"])
+        called_inst = broker.exit_market.call_args.args[0]
+        self.assertEqual(called_inst.symbol, "INFY")

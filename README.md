@@ -1,13 +1,14 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.2
+# Zerodha Kite + GPT AI Intraday Bot V3.3
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
 optional reviewer; it is not allowed to size positions or relax risk limits.
 
-> **Live-money status:** keep `LIVE_TRADING=false`. No indicator, backtest,
-> optimizer, or AI model can guarantee profit. Passing the test suite and
-> completing a paper session demonstrate software behavior, not a durable
-> trading edge or production readiness.
+> **Live-money status:** live execution is guarded but inherently risky. Keep
+> `LIVE_TRADING=false` until broker reconciliation/recovery tests pass in your
+> deployment environment. No indicator, backtest, optimizer, or AI model can
+> guarantee profit. Passing this test suite validates software invariants, not a
+> durable trading edge or freedom from broker/network/exchange failures.
 
 ## Architecture
 
@@ -35,7 +36,7 @@ final live revalidation + trade rebuild + capacity reservation
 paper execution or guarded MIS order workflow
 ```
 
-V3.2 shards the dynamic NSE EQ universe across up to three WebSocket
+V3.3 shards the dynamic NSE EQ universe across up to three WebSocket
 connections. The default is 2,800 instruments per socket, below Kite's
 documented 3,000-instrument limit. All sockets update one thread-safe tick
 store; no fixed watchlist is required.
@@ -87,7 +88,7 @@ execution loop and preserves the cleanest deterministic paper baseline.
 | --- | --- | --- |
 | `off` | Makes no execution-loop OpenAI call and records the deterministic baseline as `OFF`. | Default paper measurement. |
 | `shadow` | Calls OpenAI synchronously. The label is not a direct veto, but latency can cross the entry cutoff or change final revalidation. | Timing-sensitive paper experiment, not an execution-neutral baseline. |
-| `gate` | Calls OpenAI synchronously and requires approval plus configured thresholds; errors fail closed. | Experimental paper use only. |
+| `gate` | Calls OpenAI synchronously and requires approval plus configured thresholds; errors fail closed. | Guarded paper/live use after execution-path validation. |
 
 Online reviews are capped by `MAX_AI_REVIEWS_PER_SCAN`. Successful API reviews
 record an input hash, decision ID, actual response model/ID, latency, and basic
@@ -218,9 +219,66 @@ LIVE_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY
 It also requires an explicit `AI_MODE=off` or `AI_MODE=gate`; `shadow` is
 rejected. The process verifies its public IPv4 against `KITE_STATIC_IP` before
 live broker operation. These are mistake-prevention controls, not evidence that
-the strategy is safe, compliant, or profitable. This audit does not approve any
-live deployment: keep live trading off even if the flags can technically be
-satisfied.
+the strategy is safe, compliant, or profitable.
+
+### Dedicated-account recovery (V3.3)
+
+If this Zerodha account is used only by this bot for NSE/MIS intraday activity,
+you may explicitly set:
+
+```dotenv
+DEDICATED_BOT_ACCOUNT=true
+MAX_KILL_SWITCH_FLATTEN_ATTEMPTS=3
+KILL_SWITCH_RETRY_SECONDS=5
+```
+
+Dedicated mode changes **recovery only**, not signal generation. When strict
+local order metadata is missing or stale, the bot may use the broker's actual
+NSE/MIS order book and signed position for the affected symbol, cancel every
+active NSE/MIS order for that symbol, then submit exactly one market-protected
+order for the residual signed position. The position is re-read before and after
+mutations, and active orders are terminalized again after flat verification so
+an orphan stop cannot reverse a flat account. Non-dedicated mode retains the
+original fail-closed ownership checks.
+
+V3.3 also treats a broker-issued persisted `order_id` as the primary identity of
+an order after submission. A missing `tag` in an asynchronous/history payload no
+longer makes the bot disown its own stop. An SL-M in `TRIGGER PENDING` with the
+correct side, quantity, trigger and broker order ID is considered armed. WebSocket
+order updates are deduplicated and treated as events/cache; REST order-book state
+is preferred for authoritative reconciliation. Kill-switch flatten retries are
+bounded; after the configured attempt count the state becomes
+`manual_intervention_required=true` and no further automatic broker mutations are
+issued.
+
+### Emergency recovery utility
+
+Stop the main bot before running the utility. On a dedicated account, if a live
+position/order is left after a halt:
+
+```bash
+.venv/bin/python recover_account.py \
+  --confirm FLATTEN_DEDICATED_ACCOUNT
+```
+
+The utility touches only NSE/MIS orders and positions. It cancels active NSE/MIS
+orders per affected symbol, flattens only the verified residual signed position,
+and verifies that no NSE/MIS position or active order remains. To back up an old
+state file and create fresh state **only after broker-flat verification**:
+
+```bash
+.venv/bin/python recover_account.py \
+  --confirm FLATTEN_DEDICATED_ACCOUNT \
+  --reset-state-after-flat
+```
+
+Do not delete `bot_state.json`, reset the kill switch, or launch another bot
+process while a broker position/order still exists.
+
+These controls reduce known execution/reconciliation risks; they do not guarantee
+that all broker, network, exchange, or market failures are recoverable, and they
+do not establish strategy profitability. Start any live deployment with a
+small supervised canary.
 
 ## Promotion checklist
 

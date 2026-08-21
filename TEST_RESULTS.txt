@@ -1,0 +1,38 @@
+V3.3 verification run
+Date: 2026-08-21
+
+Commands:
+  PYTHONPATH=/mnt/data/test_stubs:$PWD python -m pytest -q \
+    tests/test_bot_safety.py tests/test_trading_core.py \
+    tests/test_performance_report.py tests/test_ai_ideas.py
+
+Result:
+  92 passed, 25 subtests passed
+
+Additional verification:
+  python -m compileall -q bot.py trading_core.py ai_ideas.py \
+    performance_report.py recover_account.py tests
+  Result: success
+
+Test scope:
+- deterministic strategy helper/risk invariants
+- order snapshot normalization and state ordering
+- ambiguous entry/exit submission recovery
+- partial fill/rejection/cancel paths
+- protective-stop identity and exact coverage checks
+- regression for TRIGGER PENDING stop with exact broker order ID and missing tag
+- duplicate/out-of-order WebSocket order update idempotency
+- authoritative order-book preference
+- dedicated-account cancel/flatten recovery
+- stop-fill-vs-cancel race (no double exit)
+- ambiguous recovery exit (no resubmission in same process)
+- startup recovery of untracked position/unowned NSE/MIS order in dedicated mode
+- non-dedicated fail-closed ownership behavior
+- bounded kill-switch retry/manual-intervention transition
+- recovery for a symbol missing from scanner instrument universe
+- accounting/performance/AI idea worker tests
+
+The execution tests use local fake broker/SDK stubs; no real Zerodha order was
+submitted by this verification. A real OMS/network/exchange lifecycle cannot be
+fully reproduced by unit tests. Use a small supervised canary after the account
+is reconciled flat.

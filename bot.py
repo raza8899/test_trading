@@ -116,6 +116,12 @@ LIVE_TRADING_CONFIRM = os.getenv(
     "LIVE_TRADING_CONFIRM",
     "",
 ).strip()
+# When true, the Zerodha account is treated as dedicated to this bot for NSE/MIS
+# intraday activity. Recovery is then allowed to cancel same-symbol NSE/MIS
+# orders and flatten residual NSE/MIS positions even when a local tag is missing.
+DEDICATED_BOT_ACCOUNT = (
+    os.getenv("DEDICATED_BOT_ACCOUNT", "false").strip().lower() == "true"
+)
 EXECUTION_MODE = "live" if LIVE_TRADING else "paper"
 
 # Capital/risk
@@ -194,6 +200,12 @@ MAX_CONSECUTIVE_LOSSES = int(
     os.getenv("MAX_CONSECUTIVE_LOSSES", "3")
 )
 MAX_EXIT_ATTEMPTS = int(os.getenv("MAX_EXIT_ATTEMPTS", "3"))
+MAX_KILL_SWITCH_FLATTEN_ATTEMPTS = int(
+    os.getenv("MAX_KILL_SWITCH_FLATTEN_ATTEMPTS", "3")
+)
+KILL_SWITCH_RETRY_SECONDS = float(
+    os.getenv("KILL_SWITCH_RETRY_SECONDS", "5")
+)
 
 # Timing
 MARKET_OPEN = dtime(9, 15)
@@ -247,7 +259,7 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.2-paper-research-20260811"
+STRATEGY_VERSION = "3.3-live-order-recovery-20260821"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
@@ -323,6 +335,9 @@ RUNTIME_MANIFEST: dict[str, Any] = {
         "paper_slippage_bps": PAPER_SLIPPAGE_BPS,
         "risk_slippage_bps": RISK_SLIPPAGE_BPS,
         "max_exit_attempts": MAX_EXIT_ATTEMPTS,
+        "dedicated_bot_account": DEDICATED_BOT_ACCOUNT,
+        "max_kill_switch_flatten_attempts": MAX_KILL_SWITCH_FLATTEN_ATTEMPTS,
+        "kill_switch_retry_seconds": KILL_SWITCH_RETRY_SECONDS,
     },
     "schedule": {
         "market_open": MARKET_OPEN.isoformat(),
@@ -844,6 +859,10 @@ def validate_configuration() -> None:
         )
     if LIVE_TRADING and AI_IDEA_MODE != "off":
         errors.append("AI idea generation is research-only in live mode")
+    if not 1 <= MAX_KILL_SWITCH_FLATTEN_ATTEMPTS <= 10:
+        errors.append("MAX_KILL_SWITCH_FLATTEN_ATTEMPTS must be between 1 and 10")
+    if KILL_SWITCH_RETRY_SECONDS <= 0:
+        errors.append("KILL_SWITCH_RETRY_SECONDS must be positive")
 
     if not 0 < RISK_PER_TRADE_PCT <= 0.02:
         errors.append("RISK_PER_TRADE_PCT must be in (0, 0.02]")
@@ -995,7 +1014,7 @@ def journal_best_effort(event: str, **fields) -> bool:
 
 def fresh_state() -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "date": str(now_ist().date()),
         "execution_mode": current_execution_mode(),
         "trades_today": 0,
@@ -1006,6 +1025,8 @@ def fresh_state() -> dict:
         "fees_paid": 0.0,
         "consecutive_losses": 0,
         "halt_reason": "",
+        "kill_switch_flatten_attempts": 0,
+        "manual_intervention_required": False,
         "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
     }
 
@@ -1076,7 +1097,7 @@ def load_state() -> dict:
     defaults = fresh_state()
     for key, value in defaults.items():
         state.setdefault(key, value)
-    state["schema_version"] = 3
+    state["schema_version"] = 4
     state["execution_mode"] = current_execution_mode()
     state["config_fingerprint"] = RUNTIME_CONFIG_FINGERPRINT
 
@@ -1093,6 +1114,11 @@ def load_state() -> dict:
         raise RuntimeError("State field 'trades_today' must be non-negative.")
     if not isinstance(state.get("kill_switch"), bool):
         raise RuntimeError("State field 'kill_switch' must be boolean.")
+    if not isinstance(state.get("manual_intervention_required"), bool):
+        raise RuntimeError("State field 'manual_intervention_required' must be boolean.")
+    attempts = state.get("kill_switch_flatten_attempts")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        raise RuntimeError("State field 'kill_switch_flatten_attempts' must be non-negative.")
     if any(
         not isinstance(symbol, str) or not symbol
         for symbol in state["blocked_symbols"]
@@ -1344,6 +1370,11 @@ class KiteBroker:
         self._last_quote_request_at = 0.0
         self._order_condition = threading.Condition()
         self._order_updates: dict[str, OrderSnapshot] = {}
+        # Same-process guard against resubmitting a recovery exit after an
+        # ambiguous HTTP response. The normal tagged recovery path should resolve
+        # accepted orders; if it cannot, further automatic mutations for that
+        # symbol are blocked until broker state proves flat.
+        self._recovery_ambiguous_symbols: set[str] = set()
 
         self.instruments, self.nifty_token = (
             self._build_dynamic_universe()
@@ -1591,13 +1622,13 @@ class KiteBroker:
                 )
 
             def on_order_update(ws, data, idx=connection_index):
-                self._record_order_update(data)
-                log(
-                    f"ORDER UPDATE [WS{idx + 1}]: "
-                    f"{data.get('tradingsymbol')} "
-                    f"{data.get('status')} "
-                    f"id={data.get('order_id')}"
-                )
+                if self._record_order_update(data):
+                    log(
+                        f"ORDER UPDATE [WS{idx + 1}]: "
+                        f"{data.get('tradingsymbol')} "
+                        f"{data.get('status')} "
+                        f"id={data.get('order_id')}"
+                    )
 
             kws.on_ticks = on_ticks
             kws.on_connect = on_connect
@@ -1637,29 +1668,66 @@ class KiteBroker:
             except Exception as exc:
                 log(f"WebSocket #{idx + 1} close warning: {exc}")
 
-    def _record_order_update(self, payload: dict) -> None:
-        """Idempotently cache duplicate postbacks from sharded sockets."""
+    @staticmethod
+    def _merge_order_snapshot_metadata(
+        incoming: OrderSnapshot,
+        current: OrderSnapshot | None,
+    ) -> OrderSnapshot:
+        """Preserve broker identity metadata when an async postback omits it.
+
+        Kite WebSocket order updates are useful wake-up events, but the broker
+        explicitly recommends consulting the order book for authoritative state.
+        Some intermediate/history payloads can omit fields such as tag. Never
+        erase already-known identity metadata merely because an asynchronous
+        update is sparse.
+        """
+        if current is None:
+            return incoming
+        return replace(
+            incoming,
+            qty=incoming.qty or current.qty,
+            avg=incoming.avg or current.avg,
+            order_type=incoming.order_type or current.order_type,
+            transaction_type=(
+                incoming.transaction_type or current.transaction_type
+            ),
+            symbol=incoming.symbol or current.symbol,
+            exchange=incoming.exchange or current.exchange,
+            product=incoming.product or current.product,
+            tag=incoming.tag or current.tag,
+            trigger_price=incoming.trigger_price or current.trigger_price,
+            message=incoming.message or current.message,
+        )
+
+    def _record_order_update(self, payload: dict) -> bool:
+        """Idempotently cache order updates from sharded sockets.
+
+        Returns True only when the cached material state changed. This suppresses
+        duplicate order-update logs received simultaneously on multiple KiteTicker
+        connections while still using every socket as a failover event source.
+        """
         try:
-            snapshot = OrderSnapshot.from_payload(payload)
+            incoming = OrderSnapshot.from_payload(payload)
         except (TypeError, ValueError) as exc:
             log(f"Invalid order postback ignored: {exc}")
-            return
+            return False
 
-        if not snapshot.order_id:
-            return
+        if not incoming.order_id:
+            return False
 
         with self._order_condition:
-            current = self._order_updates.get(snapshot.order_id)
+            current = self._order_updates.get(incoming.order_id)
+            snapshot = self._merge_order_snapshot_metadata(incoming, current)
+
+            if current is not None and snapshot == current:
+                self._order_condition.notify_all()
+                return False
+
             should_update = current is None
             if current is not None:
                 if snapshot.filled < current.filled:
-                    # Filled quantity is cumulative and cannot legitimately
-                    # move backwards, even in an out-of-order postback.
                     should_update = False
                 elif current.terminal:
-                    # A delayed OPEN/UPDATE postback must never regress a
-                    # terminal broker state. A later terminal with more
-                    # fills is still material and must win.
                     should_update = (
                         snapshot.terminal
                         and (
@@ -1674,8 +1742,8 @@ class KiteBroker:
                     and current.order_type in {"LIMIT", "MARKET"}
                     and snapshot.order_type in {"SL-M", "SLM"}
                 ):
-                    # A delayed pre-conversion stop postback must not regress a
-                    # protected SL-M already represented as MARKET/LIMIT.
+                    # A delayed pre-trigger stop postback must not regress an
+                    # already-triggered/converted protected order representation.
                     should_update = False
                 else:
                     should_update = snapshot.filled >= current.filled
@@ -1683,6 +1751,7 @@ class KiteBroker:
             if should_update:
                 self._order_updates[snapshot.order_id] = snapshot
             self._order_condition.notify_all()
+            return should_update
 
     # -------------------------------------------------------------------------
     # Market data
@@ -2071,32 +2140,71 @@ class KiteBroker:
         self,
         order_id: str,
     ) -> OrderSnapshot:
+        """Return the broker-authoritative current order state.
+
+        WebSocket updates are treated as event notifications and a fallback cache.
+        The current order book is preferred because it carries the complete current
+        identity (including tag) and avoids acting on sparse/out-of-order postbacks.
+        """
         order_id = str(order_id).strip()
         if not order_id:
             raise ValueError("order_id is required")
 
+        orderbook_error: Exception | None = None
+        try:
+            matches = []
+            for payload in self.kite.orders():
+                if str(payload.get("order_id") or "").strip() != order_id:
+                    continue
+                matches.append(payload)
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"Broker order book contains duplicate order id {order_id}."
+                )
+            if matches:
+                snapshot = OrderSnapshot.from_payload(matches[0])
+                self._record_order_update(matches[0])
+                return snapshot
+        except Exception as exc:
+            orderbook_error = exc
+
+        history_error: Exception | None = None
         try:
             history = self.kite.order_history(order_id)
-        except Exception:
-            # WebSocket postbacks are an independent state source. During a
-            # transient REST failure, retain a known terminal/partial state.
-            with self._order_condition:
-                cached = self._order_updates.get(order_id)
-            if cached is not None:
-                return cached
-            raise
-
-        if history:
-            snapshot = OrderSnapshot.from_payload(history[-1])
-            self._record_order_update(history[-1])
-            with self._order_condition:
-                return self._order_updates.get(order_id, snapshot)
+            if history:
+                snapshot = OrderSnapshot.from_payload(history[-1])
+                with self._order_condition:
+                    cached = self._order_updates.get(order_id)
+                snapshot = self._merge_order_snapshot_metadata(snapshot, cached)
+                self._record_order_update({
+                    "order_id": snapshot.order_id,
+                    "status": snapshot.status,
+                    "quantity": snapshot.qty,
+                    "filled_quantity": snapshot.filled,
+                    "pending_quantity": snapshot.pending,
+                    "average_price": snapshot.avg,
+                    "status_message": snapshot.message,
+                    "order_type": snapshot.order_type,
+                    "transaction_type": snapshot.transaction_type,
+                    "tradingsymbol": snapshot.symbol,
+                    "exchange": snapshot.exchange,
+                    "product": snapshot.product,
+                    "tag": snapshot.tag,
+                    "trigger_price": snapshot.trigger_price,
+                })
+                return snapshot
+        except Exception as exc:
+            history_error = exc
 
         with self._order_condition:
-            snapshot = self._order_updates.get(str(order_id))
-        if snapshot is None:
-            raise RuntimeError(f"No broker state for order {order_id}.")
-        return snapshot
+            cached = self._order_updates.get(order_id)
+        if cached is not None:
+            return cached
+
+        raise RuntimeError(
+            f"No broker state for order {order_id}; "
+            f"orderbook={orderbook_error}; history={history_error}"
+        )
 
     def wait_for_order(
         self,
@@ -3784,8 +3892,12 @@ def persist_trade(state: dict, trade: Trade) -> None:
 
 
 def halt_trading(state: dict, reason: str) -> None:
+    was_halted = bool(state.get("kill_switch"))
     state["kill_switch"] = True
     state["halt_reason"] = reason
+    if not was_halted:
+        state["kill_switch_flatten_attempts"] = 0
+        state["manual_intervention_required"] = False
     try:
         save_state(state)
     except Exception as exc:
@@ -3865,6 +3977,16 @@ def emergency_flatten_without_state(
         log(f"CRITICAL {trade.symbol}: emergency flatten has no instrument")
         return False
     if unresolved_order_intent:
+        if DEDICATED_BOT_ACCOUNT:
+            flat, recovery_ids = dedicated_force_flatten_symbol(
+                broker,
+                trade.symbol,
+                reason,
+            )
+            for order_id in recovery_ids:
+                if order_id not in trade.exit_order_ids:
+                    trade.exit_order_ids.append(order_id)
+            return flat
         log(
             f"CRITICAL {trade.symbol}: emergency flatten cannot prove an "
             "ambiguous order intent absent; manual reconciliation required"
@@ -3881,6 +4003,16 @@ def emergency_flatten_without_state(
         # Never race a separate exit against an owned entry, stop, or prior
         # exit. Unresolved cancellation is a manual-reconciliation condition.
         if not cancel_active_trade_orders(broker, trade):
+            if DEDICATED_BOT_ACCOUNT:
+                flat, recovery_ids = dedicated_force_flatten_symbol(
+                    broker,
+                    trade.symbol,
+                    reason,
+                )
+                for order_id in recovery_ids:
+                    if order_id not in trade.exit_order_ids:
+                        trade.exit_order_ids.append(order_id)
+                return flat
             log(
                 f"CRITICAL {trade.symbol}: emergency flatten blocked because "
                 "an owned order is not confirmed terminal"
@@ -4183,6 +4315,316 @@ def cancel_active_trade_orders(
     return True
 
 
+def active_nse_mis_orders_for_symbol(
+    broker: KiteBroker,
+    symbol: str,
+) -> list[OrderSnapshot]:
+    """Return every currently active NSE/MIS order for one symbol."""
+    normalized = symbol.upper()
+    active: list[OrderSnapshot] = []
+    for payload in broker.orders():
+        snapshot = OrderSnapshot.from_payload(payload)
+        if (
+            not snapshot.terminal
+            and snapshot.exchange == "NSE"
+            and snapshot.product == "MIS"
+            and snapshot.symbol == normalized
+        ):
+            active.append(snapshot)
+    return active
+
+
+def cancel_dedicated_symbol_orders(
+    broker: KiteBroker,
+    symbol: str,
+) -> bool:
+    """Cancel every active NSE/MIS order for a symbol on a dedicated account.
+
+    This recovery path deliberately does not depend on local tags. It is enabled
+    only when DEDICATED_BOT_ACCOUNT=true, and only touches NSE/MIS orders for the
+    affected symbol. After each cancellation we re-read broker state to protect
+    against a fill/cancel race.
+    """
+    if not (LIVE_TRADING and DEDICATED_BOT_ACCOUNT):
+        return False
+
+    try:
+        active = active_nse_mis_orders_for_symbol(broker, symbol)
+    except Exception as exc:
+        log(f"CRITICAL {symbol}: dedicated recovery cannot read order book: {exc}")
+        return False
+
+    for snapshot in active:
+        journal_best_effort(
+            "DEDICATED_RECOVERY_CANCEL",
+            symbol=symbol,
+            order_id=snapshot.order_id,
+            status=snapshot.status,
+            order_type=snapshot.order_type,
+            transaction_type=snapshot.transaction_type,
+            qty=snapshot.qty,
+        )
+        try:
+            terminal = broker.cancel_order_confirmed(
+                snapshot.order_id,
+                timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+            )
+            if terminal is None or not terminal.terminal:
+                log(
+                    f"CRITICAL {symbol}: dedicated cancellation did not "
+                    f"terminalize {snapshot.order_id}"
+                )
+                return False
+        except Exception as exc:
+            # Cancellation can race a trigger/fill. Re-read the authoritative
+            # broker state before deciding that recovery failed.
+            try:
+                terminal = broker.latest_order(snapshot.order_id)
+            except Exception:
+                terminal = None
+            if terminal is None or not terminal.terminal:
+                log(
+                    f"CRITICAL {symbol}: dedicated cancellation unresolved for "
+                    f"{snapshot.order_id}: {type(exc).__name__}: {exc}"
+                )
+                return False
+
+    try:
+        remaining = active_nse_mis_orders_for_symbol(broker, symbol)
+    except Exception as exc:
+        log(f"CRITICAL {symbol}: cannot verify dedicated cancellations: {exc}")
+        return False
+    if remaining:
+        log(
+            f"CRITICAL {symbol}: active NSE/MIS orders remain after dedicated "
+            f"cancellation: {[order.order_id for order in remaining]}"
+        )
+        return False
+    return True
+
+
+def dedicated_force_flatten_symbol(
+    broker: KiteBroker,
+    symbol: str,
+    reason: str,
+) -> tuple[bool, list[str]]:
+    """Best-effort deterministic flatten for a dedicated bot account.
+
+    Every pass first terminalizes all active NSE/MIS orders for the symbol, then
+    reads the signed broker position and submits one market-protected order for
+    only the residual quantity. This prevents a stale stop from later reversing
+    an already-flat position.
+    """
+    if not (LIVE_TRADING and DEDICATED_BOT_ACCOUNT):
+        return False, []
+
+    inst = broker.instrument(symbol)
+    if inst is None:
+        # A previously traded symbol may disappear from the scanner universe
+        # after an instrument-master/series change. A MARKET recovery order only
+        # needs the tradingsymbol; do not strand a dedicated-account MIS position
+        # solely because the scanner no longer knows its token/tick size.
+        inst = Instrument(
+            symbol=symbol.upper(),
+            name=symbol.upper(),
+            token=0,
+            tick_size=0.05,
+        )
+        log(
+            f"WARNING {symbol}: using symbol-only instrument fallback for "
+            "dedicated MARKET recovery."
+        )
+
+    recovery_order_ids: list[str] = []
+    ambiguous_symbols = getattr(broker, "_recovery_ambiguous_symbols", set())
+    if not isinstance(ambiguous_symbols, set):
+        ambiguous_symbols = set()
+    setattr(broker, "_recovery_ambiguous_symbols", ambiguous_symbols)
+
+    for attempt in range(1, MAX_EXIT_ATTEMPTS + 1):
+        if not cancel_dedicated_symbol_orders(broker, symbol):
+            return False, recovery_order_ids
+
+        try:
+            signed_qty = broker.position_qty(symbol)
+            time.sleep(min(max(ORDER_POLL_SECONDS, 0.01), 0.50))
+            confirmed_qty = broker.position_qty(symbol)
+        except Exception as exc:
+            log(f"CRITICAL {symbol}: dedicated position read failed: {exc}")
+            return False, recovery_order_ids
+
+        if signed_qty != confirmed_qty:
+            log(
+                f"{symbol}: dedicated recovery position changed during "
+                f"stabilization ({signed_qty} -> {confirmed_qty}); retrying"
+            )
+            continue
+        signed_qty = confirmed_qty
+        if signed_qty == 0:
+            ambiguous_symbols.discard(symbol.upper())
+            journal_best_effort(
+                "DEDICATED_RECOVERY_FLAT",
+                symbol=symbol,
+                reason=reason,
+                attempts=attempt - 1,
+            )
+            return True, recovery_order_ids
+
+        if symbol.upper() in ambiguous_symbols:
+            log(
+                f"CRITICAL {symbol}: a previous recovery submission is "
+                "ambiguous; refusing another automatic exit until broker state "
+                "proves the symbol flat."
+            )
+            return False, recovery_order_ids
+
+        tag = new_order_tag("RCV")
+        transaction = "SELL" if signed_qty > 0 else "BUY"
+        try:
+            order_id = submit_or_recover_order(
+                broker,
+                lambda: broker.exit_market(inst, signed_qty, tag),
+                tag=tag,
+                symbol=symbol,
+                transaction_type=transaction,
+                order_type="MARKET",
+                quantity=abs(signed_qty),
+            )
+            recovery_order_ids.append(order_id)
+            journal_best_effort(
+                "DEDICATED_RECOVERY_EXIT",
+                symbol=symbol,
+                reason=reason,
+                attempt=attempt,
+                order_id=order_id,
+                transaction_type=transaction,
+                qty=abs(signed_qty),
+            )
+            result = broker.wait_for_order(
+                order_id,
+                timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+            )
+            if not result.terminal:
+                result = broker.cancel_order_confirmed(
+                    order_id,
+                    timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+                )
+            if result is None or not result.terminal:
+                raise RuntimeError("dedicated recovery exit did not become terminal")
+            if result.status == "REJECTED":
+                log(
+                    f"{symbol}: dedicated recovery exit rejected on attempt "
+                    f"{attempt}: {result.message}"
+                )
+        except Exception as exc:
+            log(
+                f"CRITICAL {symbol}: dedicated recovery exit attempt {attempt} "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            if "UNKNOWN broker submission" in str(exc):
+                ambiguous_symbols.add(symbol.upper())
+                journal_best_effort(
+                    "DEDICATED_RECOVERY_AMBIGUOUS",
+                    symbol=symbol,
+                    reason=reason,
+                    tag=tag,
+                )
+                # Never resubmit after an ambiguous response. A later broker
+                # reconciliation or explicit operator recovery must resolve it.
+                return False, recovery_order_ids
+
+        try:
+            if broker.wait_for_position_qty(
+                symbol,
+                0,
+                timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+            ):
+                # One last order-book pass prevents an orphan stop/exit from
+                # reversing the now-flat position.
+                if cancel_dedicated_symbol_orders(broker, symbol):
+                    ambiguous_symbols.discard(symbol.upper())
+                    return True, recovery_order_ids
+        except Exception:
+            pass
+
+    return False, recovery_order_ids
+
+
+def finalize_dedicated_recovery_close(
+    broker: KiteBroker,
+    state: dict,
+    trade: Trade,
+    reason: str,
+    recovery_order_ids: list[str],
+) -> bool:
+    """Bring durable state/accounting in sync after dedicated broker recovery."""
+    for order_id in recovery_order_ids:
+        if order_id not in trade.exit_order_ids:
+            trade.exit_order_ids.append(order_id)
+    if recovery_order_ids:
+        trade.exit_order_id = recovery_order_ids[-1]
+        trade.exit_status = "COMPLETE"
+    trade.status = "EXIT_PENDING"
+    try:
+        persist_trade(state, trade)
+    except Exception as exc:
+        halt_trading(
+            state,
+            f"{trade.symbol}: dedicated recovery state persistence failed: {exc}",
+        )
+        return False
+
+    exit_price = broker_fill_average(
+        broker,
+        [*trade.exit_order_ids, trade.exit_order_id, trade.stop_order_id],
+    )
+    if exit_price <= 0:
+        trade.accounting_uncertain = True
+        trade.accounting_note = (
+            "dedicated account was flattened but actual exit fill price could not "
+            "be reconstructed"
+        )
+        state["trades"][trade.symbol] = asdict(trade)
+    return mark_trade_closed(
+        state,
+        trade.symbol,
+        reason,
+        exit_price=exit_price,
+        exit_order_id=trade.exit_order_id,
+    )
+
+
+def recover_trade_on_dedicated_account(
+    broker: KiteBroker,
+    state: dict,
+    trade: Trade,
+    reason: str,
+    detail: str,
+) -> bool:
+    """Halt new entries, then recover one tracked symbol on a dedicated account."""
+    halt_trading(state, detail)
+    if not DEDICATED_BOT_ACCOUNT:
+        return False
+    log(
+        f"{trade.symbol}: entering dedicated-account recovery because strict "
+        f"identity reconciliation failed ({detail})"
+    )
+    flat, recovery_ids = dedicated_force_flatten_symbol(
+        broker,
+        trade.symbol,
+        reason,
+    )
+    if not flat:
+        return False
+    return finalize_dedicated_recovery_close(
+        broker,
+        state,
+        trade,
+        reason,
+        recovery_ids,
+    )
+
+
 def resolve_order_intent(
     broker: KiteBroker,
     *,
@@ -4208,6 +4650,25 @@ def resolve_order_intent(
     return None
 
 
+def _known_order_reference_matches(
+    snapshot: OrderSnapshot,
+    *,
+    expected_order_id: str | None,
+    expected_tags: list[str],
+) -> bool:
+    """Match a broker order by durable order id first, tag only as fallback.
+
+    Kite order IDs are broker-issued unique identities. Once an order ID has been
+    persisted, a missing tag in an order-history/postback payload must not make the
+    bot disown its own order. Tags remain essential for recovering an ambiguous
+    submission before the order ID is known.
+    """
+    if expected_order_id:
+        return snapshot.order_id == str(expected_order_id)
+    valid_tags = {str(tag) for tag in expected_tags if tag}
+    return bool(valid_tags and snapshot.tag in valid_tags)
+
+
 def stop_identity_matches(
     stop: OrderSnapshot | None,
     trade: Trade,
@@ -4219,30 +4680,76 @@ def stop_identity_matches(
         return False
     expected_transaction = "SELL" if trade.side == "LONG" else "BUY"
     trigger_tolerance = max(inst.tick_size / 2, 0.01) + 1e-9
+    reference_matches = _known_order_reference_matches(
+        stop,
+        expected_order_id=trade.stop_order_id,
+        expected_tags=[trade.stop_tag],
+    )
     return bool(
-        stop.symbol == trade.symbol.upper()
+        reference_matches
+        and stop.symbol == trade.symbol.upper()
         and stop.exchange == "NSE"
         and stop.product == "MIS"
         and stop.order_type in allowed_broker_order_types("SL-M")
         and stop.transaction_type == expected_transaction
         and stop.qty == order_qty
-        and bool(trade.stop_tag)
-        and stop.tag == trade.stop_tag
         and abs(stop.trigger_price - trade.stop_price) <= trigger_tolerance
     )
 
 
+def stop_identity_mismatches(
+    stop: OrderSnapshot | None,
+    trade: Trade,
+    order_qty: int,
+    inst: Instrument,
+) -> list[str]:
+    """Return non-sensitive field-level reasons a protective stop is rejected."""
+    if stop is None:
+        return ["missing_order"]
+    expected_transaction = "SELL" if trade.side == "LONG" else "BUY"
+    trigger_tolerance = max(inst.tick_size / 2, 0.01) + 1e-9
+    reasons: list[str] = []
+    if not _known_order_reference_matches(
+        stop,
+        expected_order_id=trade.stop_order_id,
+        expected_tags=[trade.stop_tag],
+    ):
+        reasons.append("order_reference")
+    if stop.symbol != trade.symbol.upper():
+        reasons.append(f"symbol:{stop.symbol or '<missing>'}")
+    if stop.exchange != "NSE":
+        reasons.append(f"exchange:{stop.exchange or '<missing>'}")
+    if stop.product != "MIS":
+        reasons.append(f"product:{stop.product or '<missing>'}")
+    if stop.order_type not in allowed_broker_order_types("SL-M"):
+        reasons.append(f"order_type:{stop.order_type or '<missing>'}")
+    if stop.transaction_type != expected_transaction:
+        reasons.append(
+            f"transaction:{stop.transaction_type or '<missing>'}!={expected_transaction}"
+        )
+    if stop.qty != order_qty:
+        reasons.append(f"qty:{stop.qty}!={order_qty}")
+    if abs(stop.trigger_price - trade.stop_price) > trigger_tolerance:
+        reasons.append(
+            f"trigger:{stop.trigger_price:.4f}!={trade.stop_price:.4f}"
+        )
+    return reasons
+
+
 def entry_identity_matches(entry: OrderSnapshot, trade: Trade) -> bool:
+    reference_matches = _known_order_reference_matches(
+        entry,
+        expected_order_id=trade.entry_order_id,
+        expected_tags=[trade.entry_tag],
+    )
     return bool(
-        (not trade.entry_order_id or entry.order_id == str(trade.entry_order_id))
+        reference_matches
         and entry.symbol == trade.symbol.upper()
         and entry.exchange == "NSE"
         and entry.product == "MIS"
         and entry.order_type in allowed_broker_order_types("MARKET")
         and entry.transaction_type == ("BUY" if trade.side == "LONG" else "SELL")
         and entry.qty == (trade.requested_qty or trade.qty)
-        and bool(trade.entry_tag)
-        and entry.tag == trade.entry_tag
     )
 
 
@@ -4252,14 +4759,19 @@ def exit_identity_matches(exit_order: OrderSnapshot, trade: Trade) -> bool:
         or ("SELL" if trade.side == "LONG" else "BUY")
     )
     expected_quantity = abs(trade.exit_intent_qty) if trade.exit_intent_qty else 0
+    known_ids = [*trade.exit_order_ids]
+    if trade.exit_order_id:
+        known_ids.append(trade.exit_order_id)
+    id_match = bool(
+        known_ids and exit_order.order_id in {str(value) for value in known_ids if value}
+    )
+    tag_match = bool(
+        not id_match
+        and trade.exit_tags
+        and exit_order.tag in {str(tag) for tag in trade.exit_tags if tag}
+    )
     return bool(
-        (
-            exit_order.order_id in set(trade.exit_order_ids + [trade.exit_order_id])
-            or (
-                not trade.exit_order_id
-                and exit_order.tag in set(trade.exit_tags)
-            )
-        )
+        (id_match or tag_match)
         and exit_order.symbol == trade.symbol.upper()
         and exit_order.exchange == "NSE"
         and exit_order.product == "MIS"
@@ -4267,8 +4779,6 @@ def exit_identity_matches(exit_order: OrderSnapshot, trade: Trade) -> bool:
         and exit_order.transaction_type == expected_transaction
         and exit_order.qty > 0
         and (not expected_quantity or exit_order.qty == expected_quantity)
-        and bool(exit_order.tag)
-        and exit_order.tag in set(trade.exit_tags)
     )
 
 
@@ -4289,8 +4799,6 @@ def order_owned_for_cancellation(
             and snapshot.order_type in allowed_broker_order_types("SL-M")
             and snapshot.transaction_type == expected_transaction
             and snapshot.qty == trade.qty
-            and bool(trade.stop_tag)
-            and snapshot.tag == trade.stop_tag
         )
     return exit_identity_matches(snapshot, trade)
 
@@ -4588,26 +5096,32 @@ def close_trade_market(
             quantities=[trade.requested_qty or trade.qty],
         )
         if entry_snapshot is None:
-            halt_trading(
+            return recover_trade_on_dedicated_account(
+                broker,
                 state,
+                trade,
+                reason,
                 f"{symbol}: entry submission remains ambiguous; refusing another mutation",
             )
-            return False
         trade.entry_order_id = entry_snapshot.order_id
         persist_trade(state, trade)
     elif trade.entry_order_id:
         try:
             entry_snapshot = broker.latest_order(trade.entry_order_id)
         except Exception as exc:
-            halt_trading(state, f"{symbol}: entry state unavailable during exit: {exc}")
-            return False
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
+                f"{symbol}: entry state unavailable during exit: {exc}",
+            )
 
     if entry_snapshot is not None and not entry_identity_matches(
         entry_snapshot,
         trade,
     ):
-        halt_trading(state, f"{symbol}: entry order identity mismatch")
-        return False
+        return recover_trade_on_dedicated_account(
+            broker, state, trade, reason,
+            f"{symbol}: entry order identity mismatch",
+        )
 
     entry_cancelled_now = False
     if entry_snapshot is not None and not entry_snapshot.terminal:
@@ -4620,8 +5134,10 @@ def close_trade_market(
             entry_cancelled_now = True
             persist_trade(state, trade)
         except Exception as exc:
-            halt_trading(state, f"{symbol}: entry cancellation unresolved: {exc}")
-            return False
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
+                f"{symbol}: entry cancellation unresolved: {exc}",
+            )
 
     if entry_snapshot is not None:
         apply_confirmed_entry_snapshot(broker, trade, entry_snapshot, inst)
@@ -4649,11 +5165,10 @@ def close_trade_market(
             quantities=[trade.qty, abs(qty_now)],
         )
         if stop_intent is None:
-            halt_trading(
-                state,
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
                 f"{symbol}: stop submission remains ambiguous; manual reconciliation required",
             )
-            return False
         trade.stop_order_id = stop_intent.order_id
         trade.stop_status = stop_intent.status
         persist_trade(state, trade)
@@ -4684,11 +5199,10 @@ def close_trade_market(
             ),
         )
         if exit_intent is None:
-            halt_trading(
-                state,
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
                 f"{symbol}: exit submission remains ambiguous; refusing duplicate exit",
             )
-            return False
         trade.exit_order_id = exit_intent.order_id
         if exit_intent.order_id not in trade.exit_order_ids:
             trade.exit_order_ids.append(exit_intent.order_id)
@@ -4738,8 +5252,10 @@ def close_trade_market(
                     trade.exit_tag = ""
                     persist_trade(state, trade)
         except Exception as exc:
-            halt_trading(state, f"{symbol}: prior exit reconciliation failed: {exc}")
-            return False
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
+                f"{symbol}: prior exit reconciliation failed: {exc}",
+            )
 
     qty_now = broker.position_qty(symbol)
 
@@ -4747,8 +5263,10 @@ def close_trade_market(
         try:
             stop = broker.latest_order(trade.stop_order_id)
         except Exception as exc:
-            halt_trading(state, f"{symbol}: stop state unavailable during exit: {exc}")
-            return False
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
+                f"{symbol}: stop state unavailable during exit: {exc}",
+            )
 
         original_stop_identity = stop_identity_matches(
             stop,
@@ -4761,11 +5279,14 @@ def close_trade_market(
             and order_owned_for_cancellation(stop, trade, inst)
         )
         if not (original_stop_identity or converted_stop_identity):
-            halt_trading(
-                state,
-                f"{symbol}: protective stop identity mismatch; refusing mutation",
+            mismatch_detail = stop_identity_mismatches(
+                stop, trade, trade.qty, inst
             )
-            return False
+            return recover_trade_on_dedicated_account(
+                broker, state, trade, reason,
+                f"{symbol}: protective stop identity mismatch "
+                f"({mismatch_detail}); refusing strict mutation",
+            )
 
         if stop.status == "COMPLETE" and stop.filled == 0:
             halt_trading(
@@ -5345,10 +5866,18 @@ def execute_trade(
                         exit_order_id=trade.stop_order_id,
                     )
                     return
+                identity_mismatches = stop_identity_mismatches(
+                    stop,
+                    trade,
+                    abs(expected_qty),
+                    inst,
+                )
                 raise RuntimeError(
                     "protective stop not verified: "
-                    f"status={stop.status}, pending={stop.pending}, "
-                    f"position_matches={position_matches}"
+                    f"order_id={stop.order_id}, status={stop.status}, "
+                    f"armed={stop.stop_armed}, pending={stop.pending}, "
+                    f"position_matches={position_matches}, "
+                    f"identity_mismatches={identity_mismatches}"
                 )
         except Exception as exc:
             fail_safe_trade_lifecycle(
@@ -5555,6 +6084,32 @@ def flatten_all(
             for symbol, quantity in broker_mis_position_quantities(broker).items()
             if quantity != 0
         )
+        if remaining and DEDICATED_BOT_ACCOUNT:
+            for symbol in list(remaining):
+                flat, recovery_ids = dedicated_force_flatten_symbol(
+                    broker,
+                    symbol,
+                    reason,
+                )
+                if not flat:
+                    success = False
+                    continue
+                data = state.get("trades", {}).get(symbol)
+                if isinstance(data, dict):
+                    trade = trade_from_dict(data)
+                    if not trade.status.startswith("CLOSED"):
+                        success = finalize_dedicated_recovery_close(
+                            broker,
+                            state,
+                            trade,
+                            reason,
+                            recovery_ids,
+                        ) and success
+            remaining = sorted(
+                symbol
+                for symbol, quantity in broker_mis_position_quantities(broker).items()
+                if quantity != 0
+            )
         if remaining:
             success = False
             halt_trading(
@@ -5629,11 +6184,37 @@ def reconcile_startup(
     }
     untracked = sorted(set(positions) - tracked)
     if untracked:
-        raise RuntimeError(
-            "Live MIS positions exist that this bot does not track: "
-            + ", ".join(untracked)
-            + ". Refusing to start."
+        if not DEDICATED_BOT_ACCOUNT:
+            raise RuntimeError(
+                "Live MIS positions exist that this bot does not track: "
+                + ", ".join(untracked)
+                + ". Refusing to start."
+            )
+        log(
+            "Dedicated-account startup recovery: flattening untracked NSE/MIS "
+            "positions before accepting new work: " + ", ".join(untracked)
         )
+        for symbol in untracked:
+            flat, _ = dedicated_force_flatten_symbol(
+                broker,
+                symbol,
+                "STARTUP_UNTRACKED_POSITION",
+            )
+            if not flat:
+                raise RuntimeError(
+                    f"Dedicated startup recovery could not flatten {symbol}."
+                )
+        positions = {
+            symbol: quantity
+            for symbol, quantity in broker_mis_position_quantities(broker).items()
+            if quantity != 0
+        }
+        still_untracked = sorted(set(positions) - tracked)
+        if still_untracked:
+            raise RuntimeError(
+                "Dedicated startup recovery left untracked positions: "
+                + ", ".join(still_untracked)
+            )
 
     known_ids: dict[str, str] = {}
     known_tags: dict[str, str] = {}
@@ -5665,10 +6246,35 @@ def reconcile_startup(
         bot_owned = bool(owner_symbol or is_generated_order_tag(snapshot.tag))
         if not bot_owned:
             if snapshot.exchange == "NSE" and snapshot.product == "MIS":
-                raise RuntimeError(
-                    f"Unowned active NSE/MIS order {snapshot.order_id} exists; "
-                    "use an account dedicated to this bot."
+                if not DEDICATED_BOT_ACCOUNT:
+                    raise RuntimeError(
+                        f"Unowned active NSE/MIS order {snapshot.order_id} exists; "
+                        "use an account dedicated to this bot."
+                    )
+                log(
+                    f"Dedicated-account startup recovery: cancelling active "
+                    f"NSE/MIS order {snapshot.order_id} for {snapshot.symbol}."
                 )
+                try:
+                    terminal = broker.cancel_order_confirmed(
+                        snapshot.order_id,
+                        timeout_seconds=EXIT_FILL_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    try:
+                        terminal = broker.latest_order(snapshot.order_id)
+                    except Exception:
+                        terminal = None
+                    if terminal is None or not terminal.terminal:
+                        raise RuntimeError(
+                            f"Could not terminalize dedicated-account startup "
+                            f"order {snapshot.order_id}"
+                        ) from exc
+                if terminal is None or not terminal.terminal:
+                    raise RuntimeError(
+                        f"Dedicated-account startup order {snapshot.order_id} "
+                        "remains active"
+                    )
             continue
         if owner_symbol in tracked:
             owner = trade_from_dict(state["trades"][owner_symbol])
@@ -5692,15 +6298,52 @@ def reconcile_startup(
                     owner.qty,
                     owner_inst,
                 ):
-                    raise RuntimeError(
-                        f"Persisted stop identity mismatch for {owner_symbol}"
+                    if not DEDICATED_BOT_ACCOUNT:
+                        raise RuntimeError(
+                            f"Persisted stop identity mismatch for {owner_symbol}"
+                        )
+                    detail = stop_identity_mismatches(
+                        snapshot, owner, owner.qty, owner_inst
                     )
+                    log(
+                        f"Dedicated-account startup recovery: persisted stop "
+                        f"mismatch for {owner_symbol}: {detail}"
+                    )
+                    flat, recovery_ids = dedicated_force_flatten_symbol(
+                        broker, owner_symbol, "STARTUP_STOP_IDENTITY_MISMATCH"
+                    )
+                    if not flat:
+                        raise RuntimeError(
+                            f"Dedicated startup recovery could not flatten "
+                            f"{owner_symbol} after stop identity mismatch."
+                        )
+                    finalize_dedicated_recovery_close(
+                        broker, state, owner,
+                        "STARTUP_STOP_IDENTITY_MISMATCH", recovery_ids,
+                    )
+                    tracked.discard(owner_symbol)
+                    continue
                 continue
             if not order_owned_for_cancellation(snapshot, owner, owner_inst):
-                raise RuntimeError(
-                    f"Persisted order identity mismatch for {owner_symbol}: "
-                    f"{snapshot.order_id}"
+                if not DEDICATED_BOT_ACCOUNT:
+                    raise RuntimeError(
+                        f"Persisted order identity mismatch for {owner_symbol}: "
+                        f"{snapshot.order_id}"
+                    )
+                flat, recovery_ids = dedicated_force_flatten_symbol(
+                    broker, owner_symbol, "STARTUP_ORDER_IDENTITY_MISMATCH"
                 )
+                if not flat:
+                    raise RuntimeError(
+                        f"Dedicated startup recovery could not flatten "
+                        f"{owner_symbol} after order identity mismatch."
+                    )
+                finalize_dedicated_recovery_close(
+                    broker, state, owner,
+                    "STARTUP_ORDER_IDENTITY_MISMATCH", recovery_ids,
+                )
+                tracked.discard(owner_symbol)
+                continue
         try:
             terminal = broker.cancel_order_confirmed(
                 snapshot.order_id,
@@ -5724,11 +6367,23 @@ def reconcile_startup(
     }
     untracked_after_cancels = sorted(set(positions) - tracked)
     if untracked_after_cancels:
-        raise RuntimeError(
-            "An orphan order changed broker exposure during startup: "
-            + ", ".join(untracked_after_cancels)
-            + ". Refusing to start."
-        )
+        if not DEDICATED_BOT_ACCOUNT:
+            raise RuntimeError(
+                "An orphan order changed broker exposure during startup: "
+                + ", ".join(untracked_after_cancels)
+                + ". Refusing to start."
+            )
+        for symbol in untracked_after_cancels:
+            flat, _ = dedicated_force_flatten_symbol(
+                broker,
+                symbol,
+                "STARTUP_ORPHAN_FILL",
+            )
+            if not flat:
+                raise RuntimeError(
+                    f"Dedicated startup recovery could not flatten orphan fill "
+                    f"for {symbol}."
+                )
 
     for symbol in sorted(tracked):
         trade = trade_from_dict(state["trades"][symbol])
@@ -6235,6 +6890,88 @@ def scan_for_new_trades(
         )
 
 
+def handle_kill_switch_recovery(
+    broker: KiteBroker,
+    state: dict,
+) -> bool:
+    """Perform a bounded kill-switch flatten attempt.
+
+    Returns True when the account/state no longer contains active tracked
+    exposure. After a bounded number of failed attempts the bot stops issuing
+    broker mutations and marks the state for explicit operator intervention.
+    """
+    if not state.get("kill_switch"):
+        return True
+    if open_trade_count(state) == 0:
+        return True
+    if state.get("manual_intervention_required"):
+        return False
+
+    attempts = int(state.get("kill_switch_flatten_attempts", 0))
+    if attempts >= MAX_KILL_SWITCH_FLATTEN_ATTEMPTS:
+        state["manual_intervention_required"] = True
+        state["halt_reason"] = (
+            str(state.get("halt_reason") or "kill switch active")
+            + "; automatic flatten recovery exhausted"
+        )
+        try:
+            save_state(state)
+        except Exception as exc:
+            log(f"CRITICAL kill-switch terminal state write failed: {exc}")
+        journal_best_effort(
+            "MANUAL_INTERVENTION_REQUIRED",
+            reason=state["halt_reason"],
+            attempts=attempts,
+        )
+        log(
+            "CRITICAL: automatic kill-switch recovery exhausted; "
+            "no further broker mutations will be attempted automatically."
+        )
+        return False
+
+    attempts += 1
+    state["kill_switch_flatten_attempts"] = attempts
+    try:
+        save_state(state)
+    except Exception as exc:
+        log(f"CRITICAL kill-switch attempt persistence failed: {exc}")
+
+    log(
+        f"Kill-switch flatten attempt {attempts}/"
+        f"{MAX_KILL_SWITCH_FLATTEN_ATTEMPTS}."
+    )
+    flattened = flatten_all(broker, state, "KILL_SWITCH")
+    if flattened and open_trade_count(state) == 0:
+        state["kill_switch_flatten_attempts"] = 0
+        try:
+            save_state(state)
+        except Exception as exc:
+            log(f"Kill-switch flat-state persistence warning: {exc}")
+        log("Kill-switch exposure flatten verified complete; trading remains halted.")
+        return True
+
+    if attempts >= MAX_KILL_SWITCH_FLATTEN_ATTEMPTS:
+        state["manual_intervention_required"] = True
+        state["halt_reason"] = (
+            str(state.get("halt_reason") or "kill switch active")
+            + "; automatic flatten recovery exhausted"
+        )
+        try:
+            save_state(state)
+        except Exception as exc:
+            log(f"CRITICAL kill-switch terminal state write failed: {exc}")
+        journal_best_effort(
+            "MANUAL_INTERVENTION_REQUIRED",
+            reason=state["halt_reason"],
+            attempts=attempts,
+        )
+        log(
+            "CRITICAL: automatic kill-switch recovery exhausted; "
+            "manual broker reconciliation is required."
+        )
+    return False
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -6402,13 +7139,8 @@ def _run_main() -> None:
                 continue
 
             if state.get("kill_switch"):
-                if open_trade_count(state) > 0:
-                    flatten_all(
-                        broker,
-                        state,
-                        "KILL_SWITCH",
-                    )
-                time.sleep(2)
+                handle_kill_switch_recovery(broker, state)
+                time.sleep(KILL_SWITCH_RETRY_SECONDS)
                 continue
 
             entry_window = entry_window_open(now)
