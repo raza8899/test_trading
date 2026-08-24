@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ipaddress
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -259,7 +260,7 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.3-live-order-recovery-20260821"
+STRATEGY_VERSION = "3.4-protected-slm-compat-20260824"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
@@ -772,17 +773,51 @@ def is_generated_order_tag(tag: str) -> bool:
 
 
 def allowed_broker_order_types(requested_order_type: str) -> frozenset[str]:
-    """Return documented effective types for protected Kite order intents."""
+    """Return broad post-trigger broker representations for an order intent.
+
+    This helper is intentionally *not* sufficient to validate an armed stop.
+    Armed-stop compatibility is state-sensitive and handled by
+    ``broker_order_type_matches_intent`` below. In particular, a live
+    market-protected SL-M can be reported by Kite as ``SL`` while it is still
+    ``TRIGGER PENDING``. Treating ``SL`` as globally interchangeable with
+    ``SL-M`` would be too permissive, so that compatibility is accepted only in
+    the narrow armed-stop state with the rest of the order identity matching.
+    """
     requested = str(requested_order_type or "").strip().upper()
     if requested == "MARKET":
-        # Kite market protection represents the exchange mutation as bounded
-        # limit behaviour; recovery must accept either broker representation.
+        # Protected market orders can be represented as bounded LIMIT orders.
         return frozenset({"MARKET", "LIMIT"})
     if requested in {"SL-M", "SLM"}:
-        # A protected stop may be represented as SL-M while armed and as a
-        # MARKET/LIMIT order after trigger or explicit conversion.
+        # Once a stop has triggered, the broker/OMS can represent the converted
+        # child as MARKET/LIMIT. Pre-trigger ``SL`` compatibility is deliberately
+        # handled separately and only for TRIGGER PENDING orders.
         return frozenset({"SL-M", "SLM", "MARKET", "LIMIT"})
     return frozenset({requested}) if requested else frozenset()
+
+
+def broker_order_type_matches_intent(
+    snapshot: OrderSnapshot,
+    requested_order_type: str,
+) -> bool:
+    """Return whether current broker representation matches our order intent.
+
+    Zerodha requires market protection for API MARKET and SL-M orders. In live
+    NSE/MIS observations a protected SL-M can be normalised by the broker/OMS to
+    ``order_type=SL`` while it remains ``TRIGGER PENDING``. That state is still
+    an armed stop. Accept this *only* when the order is actually armed; all other
+    identity fields (broker order id/tag, symbol, side, quantity, trigger,
+    exchange and product) are validated by the caller.
+
+    This keeps the BALRAMCHIN/AEROFLEX failure class safe without weakening
+    ownership checks for arbitrary SL-limit orders.
+    """
+    requested = str(requested_order_type or "").strip().upper()
+    actual = str(snapshot.order_type or "").strip().upper()
+    if actual in allowed_broker_order_types(requested):
+        return True
+    if requested in {"SL-M", "SLM"} and actual == "SL":
+        return bool(snapshot.stop_armed)
+    return False
 
 
 def trade_from_dict(data: dict) -> Trade:
@@ -1358,6 +1393,7 @@ class KiteBroker:
             timeout=10,
         )
         self.kite.set_access_token(KITE_ACCESS_TOKEN)
+        self._validate_kite_sdk_capabilities()
 
         profile = self.kite.profile()
         log(
@@ -1370,6 +1406,10 @@ class KiteBroker:
         self._last_quote_request_at = 0.0
         self._order_condition = threading.Condition()
         self._order_updates: dict[str, OrderSnapshot] = {}
+        # Order updates are broadcast to every KiteTicker connection. Keep all
+        # sockets as event sources for redundancy, but suppress duplicate log
+        # lines that carry the same material lifecycle state.
+        self._order_log_signatures: dict[str, tuple[str, int, int, str]] = {}
         # Same-process guard against resubmitting a recovery exit after an
         # ambiguous HTTP response. The normal tagged recovery path should resolve
         # accepted orders; if it cannot, further automatic mutations for that
@@ -1414,6 +1454,39 @@ class KiteBroker:
                 "Missing: "
                 + ", ".join(missing)
                 + ". Run login.py if KITE_ACCESS_TOKEN is empty."
+            )
+
+    def _validate_kite_sdk_capabilities(self) -> None:
+        """Fail before market hours if the installed SDK cannot place protected orders.
+
+        Current live API rules require ``market_protection`` on MARKET and SL-M
+        algo orders. Older pykiteconnect builds did not expose that keyword in
+        ``place_order``. The requirements file pins a compatible SDK, but this
+        runtime check prevents a stale virtual environment from reaching the
+        first live order before discovering the mismatch.
+        """
+        if not LIVE_TRADING:
+            return
+        place_order = getattr(self.kite, "place_order", None)
+        if place_order is None:
+            raise RuntimeError("Installed Kite SDK has no place_order method")
+        try:
+            parameters = inspect.signature(place_order).parameters
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Could not verify Kite SDK place_order capabilities; refusing live trading"
+            ) from exc
+        if "market_protection" not in parameters:
+            raise RuntimeError(
+                "Installed kiteconnect SDK does not support market_protection; "
+                "install the pinned requirements before live trading"
+            )
+        if str(getattr(self.kite, "ORDER_TYPE_SLM", "")).upper() not in {
+            "SL-M",
+            "SLM",
+        }:
+            raise RuntimeError(
+                "Installed kiteconnect SDK exposes an unexpected ORDER_TYPE_SLM value"
             )
 
     def _validate_static_ip_if_live(self):
@@ -1622,7 +1695,8 @@ class KiteBroker:
                 )
 
             def on_order_update(ws, data, idx=connection_index):
-                if self._record_order_update(data):
+                changed = self._record_order_update(data)
+                if changed and self._should_log_order_update(data):
                     log(
                         f"ORDER UPDATE [WS{idx + 1}]: "
                         f"{data.get('tradingsymbol')} "
@@ -1740,10 +1814,14 @@ class KiteBroker:
                 elif (
                     snapshot.filled == current.filled
                     and current.order_type in {"LIMIT", "MARKET"}
-                    and snapshot.order_type in {"SL-M", "SLM"}
+                    and snapshot.order_type in {"SL-M", "SLM", "SL"}
+                    and snapshot.stop_armed
                 ):
                     # A delayed pre-trigger stop postback must not regress an
                     # already-triggered/converted protected order representation.
+                    # In 2026 live observations, protected SL-M can be surfaced
+                    # as order_type=SL while TRIGGER PENDING, so include that
+                    # narrow broker representation in the anti-regression rule.
                     should_update = False
                 else:
                     should_update = snapshot.filled >= current.filled
@@ -1752,6 +1830,33 @@ class KiteBroker:
                 self._order_updates[snapshot.order_id] = snapshot
             self._order_condition.notify_all()
             return should_update
+
+    def _should_log_order_update(self, payload: dict) -> bool:
+        """Suppress duplicate OMS notifications received on sharded sockets.
+
+        Kite can broadcast the same order event to every active WebSocket and
+        can emit repeated intermediate UPDATE notifications. This function only
+        affects observability; broker state reconciliation remains authoritative
+        through ``latest_order()`` / the REST order book.
+        """
+        try:
+            snapshot = OrderSnapshot.from_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        if not snapshot.order_id:
+            return False
+        signature = (
+            snapshot.status,
+            snapshot.filled,
+            snapshot.pending,
+            snapshot.order_type,
+        )
+        with self._order_condition:
+            previous = self._order_log_signatures.get(snapshot.order_id)
+            if previous == signature:
+                return False
+            self._order_log_signatures[snapshot.order_id] = signature
+            return True
 
     # -------------------------------------------------------------------------
     # Market data
@@ -2265,7 +2370,6 @@ class KiteBroker:
         quantity: int,
     ) -> OrderSnapshot | None:
         matches: list[OrderSnapshot] = []
-        allowed_types = allowed_broker_order_types(order_type)
         for payload in self.orders():
             try:
                 snapshot = OrderSnapshot.from_payload(payload)
@@ -2281,7 +2385,7 @@ class KiteBroker:
                 and snapshot.exchange == "NSE"
                 and snapshot.product == "MIS"
                 and snapshot.transaction_type == transaction_type.upper()
-                and snapshot.order_type in allowed_types
+                and broker_order_type_matches_intent(snapshot, order_type)
                 and snapshot.qty == abs(quantity)
             ):
                 matches.append(snapshot)
@@ -2365,6 +2469,15 @@ class KiteBroker:
             )
             return fake
 
+        # Keep the *request* as SL-M. Do not change this to SL merely because
+        # current broker order-book payloads can normalise a protected SL-M to
+        # order_type=SL while TRIGGER PENDING. The verifier handles that broker
+        # representation narrowly; the order intent remains stop-loss market.
+        market_protection_auto = getattr(
+            self.kite,
+            "MARKET_PROTECTION_AUTO",
+            -1,
+        )
         return self.kite.place_order(
             variety=self.kite.VARIETY_REGULAR,
             exchange=self.kite.EXCHANGE_NSE,
@@ -2375,7 +2488,7 @@ class KiteBroker:
             order_type=self.kite.ORDER_TYPE_SLM,
             trigger_price=trigger_price,
             validity=self.kite.VALIDITY_DAY,
-            market_protection=-1,
+            market_protection=market_protection_auto,
             tag=tag,
         )
 
@@ -4690,7 +4803,7 @@ def stop_identity_matches(
         and stop.symbol == trade.symbol.upper()
         and stop.exchange == "NSE"
         and stop.product == "MIS"
-        and stop.order_type in allowed_broker_order_types("SL-M")
+        and broker_order_type_matches_intent(stop, "SL-M")
         and stop.transaction_type == expected_transaction
         and stop.qty == order_qty
         and abs(stop.trigger_price - trade.stop_price) <= trigger_tolerance
@@ -4721,7 +4834,7 @@ def stop_identity_mismatches(
         reasons.append(f"exchange:{stop.exchange or '<missing>'}")
     if stop.product != "MIS":
         reasons.append(f"product:{stop.product or '<missing>'}")
-    if stop.order_type not in allowed_broker_order_types("SL-M"):
+    if not broker_order_type_matches_intent(stop, "SL-M"):
         reasons.append(f"order_type:{stop.order_type or '<missing>'}")
     if stop.transaction_type != expected_transaction:
         reasons.append(
@@ -4796,7 +4909,7 @@ def order_owned_for_cancellation(
             snapshot.symbol == trade.symbol.upper()
             and snapshot.exchange == "NSE"
             and snapshot.product == "MIS"
-            and snapshot.order_type in allowed_broker_order_types("SL-M")
+            and broker_order_type_matches_intent(snapshot, "SL-M")
             and snapshot.transaction_type == expected_transaction
             and snapshot.qty == trade.qty
         )
@@ -5876,6 +5989,7 @@ def execute_trade(
                     "protective stop not verified: "
                     f"order_id={stop.order_id}, status={stop.status}, "
                     f"armed={stop.stop_armed}, pending={stop.pending}, "
+                    f"broker_order_type={stop.order_type}, requested_order_type=SL-M, "
                     f"position_matches={position_matches}, "
                     f"identity_mismatches={identity_mismatches}"
                 )
