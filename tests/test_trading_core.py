@@ -355,6 +355,12 @@ class TradingAccountingTests(unittest.TestCase):
         self.assertEqual(one_order.brokerage, Decimal("20.00"))
         self.assertEqual(two_orders.brokerage, Decimal("30.00"))
 
+    def test_nse_transaction_charge_and_ipft_components_do_not_overlap(self) -> None:
+        costs = estimate_nse_equity_intraday_cost(5_000_000, 5_000_000)
+
+        self.assertEqual(costs.exchange_transaction_charges, Decimal("306.99"))
+        self.assertEqual(costs.ipft_charges, Decimal("0.01"))
+
     def test_rates_are_configurable(self) -> None:
         rates = NSEEquityIntradayRates(
             brokerage_rate=0,

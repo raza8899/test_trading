@@ -193,12 +193,20 @@ python performance_report.py 'logs/trades_*.jsonl' --json
 
 It reports trade count, win rate, net and gross P&L, fees, expectancy, profit
 factor, maximum drawdown, average R, and separate AI `APPROVE`, `REJECT`, and
-`ERROR` cohorts. `OFF` trades count overall but never in an AI cohort.
+`ERROR` cohorts. `OFF` trades count overall but never in an AI cohort. Results
+are also split into execution-mode/config-fingerprint experiment cohorts; a
+mixed overall or AI aggregate is labelled as non-comparable.
 
 Only `CLOSE` records with explicit finite P&L, fees, and R-multiple fields are
-used. AI attribution must be `APPROVE`, `REJECT`, `ERROR`, or `OFF`; a missing decision
-is accepted only when `ai_mode=off`. Missing or legacy data is diagnosed and
-excluded, and values are never reconstructed to make a run appear profitable.
+used. AI attribution must be `APPROVE`, `REJECT`, `ERROR`, or `OFF`; a missing
+decision is accepted only when `ai_mode=off`. Missing or legacy data is
+diagnosed and excluded, and values are never reconstructed to make a run appear
+profitable.
+Negative fees and records where `net_pnl != gross_pnl - fees` are rejected.
+Stable event IDs deduplicate a crash replay without double-counting a close.
+Fee provenance states whether charges are model-estimated or broker-confirmed;
+the bot's current close accounting is an estimate and the contract note remains
+authoritative.
 The command exits nonzero when there are no complete P&L records. This is an
 accounting report, not a leakage-safe backtester. It reports provenance as
 compatible, mixed, or unverifiable when execution mode, configuration
@@ -363,7 +371,11 @@ running concurrently. Dedicated recovery intents are stored in
 `bot_state.json`; an unresolved one deliberately prevents restart. Do not delete
 or manually clear that state while a position or broker order may exist. After a
 crash or uncertain order response, reconcile broker orders and positions before
-resuming; never assume a timeout means no order was accepted.
+resuming; never assume a timeout means no order was accepted. Realized `CLOSE`
+events are committed to a durable state outbox with the trade accounting and
+replayed after a journal failure or restart. Replays retain the same event ID.
+Repeated identical halt causes are suppressed; distinct follow-on causes are
+retained in `halt_details` without replacing the root halt reason.
 
 ## Dynamic universe and broker constraints
 

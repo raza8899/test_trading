@@ -54,6 +54,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ from kiteconnect import KiteConnect, KiteTicker
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from trading_core import (
+    NSE_EQUITY_INTRADAY_FEE_MODEL_VERSION,
     OrderSnapshot,
     SingleInstanceLock,
     StateFileError,
@@ -260,7 +262,7 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.5-execution-hardening-20260826"
+STRATEGY_VERSION = "3.6-accounting-integrity-20260826"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
@@ -476,6 +478,9 @@ class Trade:
     exit_price: float = 0.0
     gross_pnl: float = 0.0
     fees: float = 0.0
+    fees_source: str = ""
+    fee_model_version: str = ""
+    fee_breakdown: dict[str, float] = field(default_factory=dict)
     net_pnl: float = 0.0
     r_multiple: float = 0.0
     planned_risk_amount: float = 0.0
@@ -980,42 +985,116 @@ def dynamic_min_turnover_crore() -> float:
     return max(2.0, min(15.0, elapsed_min * 0.04))
 
 
-_JOURNAL_LOCK = threading.Lock()
+_JOURNAL_LOCK = threading.RLock()
+_JOURNAL_SESSION_ID = uuid.uuid4().hex
+_JOURNAL_SEQUENCE = 0
+JOURNAL_SCHEMA_VERSION = 2
 
 
-def journal(event: str, **fields) -> None:
-    """
-    JSONL avoids the changing-column problem that CSV journals get when OPEN,
-    CLOSE and AI_REVIEW events have different fields.
-    """
-    path = LOG_DIR / f"trades_{now_ist().strftime('%Y%m%d')}.jsonl"
+def _validate_journal_payload(payload: Any) -> dict[str, Any]:
+    """Validate a prepared event before it reaches an append-only journal."""
+    if not isinstance(payload, dict):
+        raise ValueError("journal payload must be an object")
+    for name in ("timestamp", "event", "event_id", "session_id"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"journal payload {name} must be non-empty text")
+    sequence = payload.get("event_sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ValueError("journal payload event_sequence must be positive")
+    try:
+        observed_at = datetime.fromisoformat(payload["timestamp"])
+    except ValueError as exc:
+        raise ValueError("journal payload timestamp must be ISO-8601") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("journal payload timestamp must include a timezone")
+    if payload.get("journal_schema_version") != JOURNAL_SCHEMA_VERSION:
+        raise ValueError("journal payload schema version is unsupported")
+    # Fail before touching the file if a caller supplied NaN or an unserialisable
+    # object. ``default=str`` intentionally matches the journal writer.
+    encoded = json.dumps(
+        payload,
+        default=str,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    # Prepared events can be embedded in the strict-JSON state outbox, so
+    # return the exact JSON-safe representation that will be journalled.
+    return json.loads(encoded)
+
+
+def _prepare_journal_event_unlocked(
+    event: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    global _JOURNAL_SEQUENCE
+    normalized_event = str(event).strip().upper()
+    if not normalized_event:
+        raise ValueError("journal event must be non-empty")
+    observed_at = now_ist()
+    _JOURNAL_SEQUENCE += 1
     payload = {
-        "timestamp": now_ist().isoformat(),
-        "event": event,
+        **fields,
+        "timestamp": observed_at.isoformat(),
+        "event": normalized_event,
+        "event_id": uuid.uuid4().hex,
+        "event_sequence": _JOURNAL_SEQUENCE,
+        "session_id": _JOURNAL_SESSION_ID,
+        "journal_schema_version": JOURNAL_SCHEMA_VERSION,
         "strategy_version": STRATEGY_VERSION,
         "code_sha256": CODE_SHA256,
         "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
         "execution_mode": current_execution_mode(),
-        **fields,
     }
+    return _validate_journal_payload(payload)
+
+
+def prepare_journal_event(event: str, **fields) -> dict[str, Any]:
+    """Reserve a stable event identity for durable state/outbox storage."""
+    with _JOURNAL_LOCK:
+        return _prepare_journal_event_unlocked(event, fields)
+
+
+def _append_journal_payload_unlocked(payload: dict[str, Any]) -> None:
+    payload = _validate_journal_payload(payload)
+    observed_at = datetime.fromisoformat(payload["timestamp"]).astimezone(
+        ZoneInfo(IST)
+    )
+    path = LOG_DIR / f"trades_{observed_at.strftime('%Y%m%d')}.jsonl"
     encoded = json.dumps(
         payload,
         default=str,
         allow_nan=False,
         separators=(",", ":"),
     ) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def append_prepared_journal_event(payload: dict[str, Any]) -> None:
+    """Append an already-identified event, including an outbox replay."""
     with _JOURNAL_LOCK:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                fd = -1
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-        finally:
-            if fd >= 0:
-                os.close(fd)
+        _append_journal_payload_unlocked(payload)
+
+
+def journal(event: str, **fields) -> str:
+    """
+    JSONL avoids the changing-column problem that CSV journals get when OPEN,
+    CLOSE and AI_REVIEW events have different fields.
+    """
+    with _JOURNAL_LOCK:
+        payload = _prepare_journal_event_unlocked(event, fields)
+        _append_journal_payload_unlocked(payload)
+    return payload["event_id"]
 
 
 def journal_best_effort(event: str, **fields) -> bool:
@@ -1034,7 +1113,7 @@ def journal_best_effort(event: str, **fields) -> bool:
 
 def fresh_state() -> dict:
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "date": str(now_ist().date()),
         "execution_mode": current_execution_mode(),
         "trades_today": 0,
@@ -1045,9 +1124,11 @@ def fresh_state() -> dict:
         "fees_paid": 0.0,
         "consecutive_losses": 0,
         "halt_reason": "",
+        "halt_details": [],
         "kill_switch_flatten_attempts": 0,
         "manual_intervention_required": False,
         "dedicated_recovery_intents": {},
+        "journal_outbox": [],
         "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
     }
 
@@ -1080,6 +1161,31 @@ def load_state() -> dict:
         raise RuntimeError(
             "State field 'dedicated_recovery_intents' must be an object."
         )
+    raw_journal_outbox = state.get("journal_outbox", [])
+    if not isinstance(raw_journal_outbox, list):
+        raise RuntimeError("State field 'journal_outbox' must be a list.")
+    outbox_event_ids: set[str] = set()
+    for payload in raw_journal_outbox:
+        try:
+            _validate_journal_payload(payload)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Persisted journal outbox event is invalid.") from exc
+        event_id = payload["event_id"]
+        if event_id in outbox_event_ids:
+            raise RuntimeError("Persisted journal outbox has duplicate event IDs.")
+        outbox_event_ids.add(event_id)
+    raw_halt_details = state.get("halt_details", [])
+    if not isinstance(raw_halt_details, list):
+        raise RuntimeError("State field 'halt_details' must be a list.")
+    for detail in raw_halt_details:
+        if (
+            not isinstance(detail, dict)
+            or not isinstance(detail.get("reason"), str)
+            or not detail["reason"].strip()
+            or not isinstance(detail.get("timestamp"), str)
+            or not detail["timestamp"].strip()
+        ):
+            raise RuntimeError("Persisted halt detail is invalid.")
     has_recovery_state = bool(raw_recovery_intents)
     persisted_statuses = {
         str(record.get("status", "")).upper()
@@ -1101,7 +1207,12 @@ def load_state() -> dict:
                 "Previous-date active state exists; refusing to discard possible "
                 "broker exposure. Manual reconciliation is required."
             )
-        return fresh_state()
+        rolled_state = fresh_state()
+        # A CLOSE event belongs to the session in which it was created.  Carry
+        # an unflushed event over the date boundary so startup can replay it to
+        # that original date's journal rather than silently discarding it.
+        rolled_state["journal_outbox"] = list(raw_journal_outbox)
+        return rolled_state
 
     stored_fingerprint = state.get("config_fingerprint")
     stored_mode = str(state.get("execution_mode") or "").strip().lower()
@@ -1143,7 +1254,7 @@ def load_state() -> dict:
     defaults = fresh_state()
     for key, value in defaults.items():
         state.setdefault(key, value)
-    state["schema_version"] = 5
+    state["schema_version"] = 6
     state["execution_mode"] = current_execution_mode()
     state["config_fingerprint"] = RUNTIME_CONFIG_FINGERPRINT
 
@@ -1155,6 +1266,10 @@ def load_state() -> dict:
         raise RuntimeError(
             "State field 'dedicated_recovery_intents' must be an object."
         )
+    if not isinstance(state.get("journal_outbox"), list):
+        raise RuntimeError("State field 'journal_outbox' must be a list.")
+    if not isinstance(state.get("halt_details"), list):
+        raise RuntimeError("State field 'halt_details' must be a list.")
 
     if (
         isinstance(state.get("trades_today"), bool)
@@ -1164,6 +1279,19 @@ def load_state() -> dict:
         raise RuntimeError("State field 'trades_today' must be non-negative.")
     if not isinstance(state.get("kill_switch"), bool):
         raise RuntimeError("State field 'kill_switch' must be boolean.")
+    if not isinstance(state.get("halt_reason"), str):
+        raise RuntimeError("State field 'halt_reason' must be text.")
+    if state["kill_switch"] and not state["halt_reason"].strip():
+        raise RuntimeError("A persisted kill switch must have a halt reason.")
+    consecutive_losses = state.get("consecutive_losses")
+    if (
+        isinstance(consecutive_losses, bool)
+        or not isinstance(consecutive_losses, int)
+        or consecutive_losses < 0
+    ):
+        raise RuntimeError(
+            "State field 'consecutive_losses' must be non-negative."
+        )
     if not isinstance(state.get("manual_intervention_required"), bool):
         raise RuntimeError("State field 'manual_intervention_required' must be boolean.")
     attempts = state.get("kill_switch_flatten_attempts")
@@ -1217,6 +1345,8 @@ def load_state() -> dict:
             raise RuntimeError(f"State field '{key}' must be numeric.")
         if not math.isfinite(float(value)):
             raise RuntimeError(f"State field '{key}' must be finite.")
+    closed_net_pnl: list[float] = []
+    closed_fees: list[float] = []
     for symbol, record in state["trades"].items():
         if not isinstance(symbol, str) or not isinstance(record, dict):
             raise RuntimeError("State trades must map symbols to objects.")
@@ -1277,6 +1407,53 @@ def load_state() -> dict:
                 or value < 0
             ):
                 raise RuntimeError(f"Persisted {symbol} {key} is invalid.")
+        for key, value in {
+            "exit_price": trade.exit_price,
+            "gross_pnl": trade.gross_pnl,
+            "fees": trade.fees,
+            "net_pnl": trade.net_pnl,
+            "r_multiple": trade.r_multiple,
+        }.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise RuntimeError(f"Persisted {symbol} {key} is invalid.")
+        if trade.fees < 0:
+            raise RuntimeError(f"Persisted {symbol} fees cannot be negative.")
+        if (
+            normalized_status.startswith("CLOSED")
+            and normalized_status != "CLOSED_UNPRICED"
+            and not math.isclose(
+                trade.net_pnl,
+                trade.gross_pnl - trade.fees,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            raise RuntimeError(f"Persisted {symbol} close accounting is inconsistent.")
+        if (
+            normalized_status.startswith("CLOSED")
+            and normalized_status != "CLOSED_UNPRICED"
+        ):
+            closed_net_pnl.append(float(trade.net_pnl))
+            closed_fees.append(float(trade.fees))
+        if not isinstance(trade.fees_source, str) or not isinstance(
+            trade.fee_model_version,
+            str,
+        ):
+            raise RuntimeError(f"Persisted {symbol} fee provenance is invalid.")
+        if not isinstance(trade.fee_breakdown, dict) or any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+            for name, value in trade.fee_breakdown.items()
+        ):
+            raise RuntimeError(f"Persisted {symbol} fee breakdown is invalid.")
         if not isinstance(trade.exit_order_ids, list) or not isinstance(
             trade.exit_tags,
             list,
@@ -1287,11 +1464,71 @@ def load_state() -> dict:
         if not isinstance(trade.accounting_uncertain, bool):
             raise RuntimeError(f"Persisted {symbol} accounting flag is invalid.")
 
+    expected_realized_pnl = math.fsum(closed_net_pnl)
+    expected_fees_paid = math.fsum(closed_fees)
+    if not math.isclose(
+        float(state["realized_pnl"]),
+        expected_realized_pnl,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "State realized_pnl does not match persisted closed trades."
+        )
+    if not math.isclose(
+        float(state["fees_paid"]),
+        expected_fees_paid,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "State fees_paid does not match persisted closed trades."
+        )
+
     return state
 
 
 def save_state(state: dict) -> None:
     atomic_write_json(STATE_FILE, state)
+
+
+def flush_journal_outbox(state: dict) -> bool:
+    """Replay durable events and remove each only after its append is fsynced.
+
+    A crash after the append but before the state update can replay an event a
+    second time.  Stable ``event_id`` values make that failure mode detectable
+    and allow the performance reporter to deduplicate it safely.
+    """
+    outbox = state.get("journal_outbox")
+    if not isinstance(outbox, list):
+        raise RuntimeError("State field 'journal_outbox' must be a list.")
+
+    while outbox:
+        payload = outbox[0]
+        try:
+            append_prepared_journal_event(payload)
+        except Exception as exc:
+            log(
+                "JOURNAL OUTBOX append failed; event remains durable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+        previous = list(outbox)
+        outbox = outbox[1:]
+        state["journal_outbox"] = outbox
+        try:
+            save_state(state)
+        except Exception as exc:
+            # The disk state still contains the event.  Retain it in memory too
+            # so a later retry uses the same identity rather than losing it.
+            state["journal_outbox"] = previous
+            log(
+                "JOURNAL OUTBOX acknowledgement failed; replay may duplicate "
+                f"event_id={payload.get('event_id')}: {type(exc).__name__}: {exc}"
+            )
+            return False
+    return True
 
 
 def open_trade_count(state: dict) -> int:
@@ -4082,19 +4319,77 @@ def persist_trade(state: dict, trade: Trade) -> None:
         raise
 
 
+def persist_trade_with_journal_event(
+    state: dict,
+    trade: Trade,
+    payload: dict[str, Any],
+) -> bool:
+    """Atomically persist a trade mutation and its durable journal intent."""
+    outbox = state.get("journal_outbox")
+    if not isinstance(outbox, list):
+        raise RuntimeError("State field 'journal_outbox' must be a list.")
+    _validate_journal_payload(payload)
+    if any(item.get("event_id") == payload["event_id"] for item in outbox):
+        raise RuntimeError("journal event is already queued")
+
+    previous_outbox = list(outbox)
+    state["journal_outbox"] = [*previous_outbox, payload]
+    try:
+        persist_trade(state, trade)
+    except Exception:
+        state["journal_outbox"] = previous_outbox
+        raise
+    return flush_journal_outbox(state)
+
+
 def halt_trading(state: dict, reason: str) -> None:
+    normalized_reason = str(reason).strip() or "unspecified safety halt"
     was_halted = bool(state.get("kill_switch"))
+    details = state.setdefault("halt_details", [])
+    if not isinstance(details, list):
+        raise RuntimeError("State field 'halt_details' must be a list.")
+
+    if was_halted:
+        root_reason = str(state.get("halt_reason") or "").strip()
+        known_reasons = {
+            str(detail.get("reason") or "").strip()
+            for detail in details
+            if isinstance(detail, dict)
+        }
+        if normalized_reason == root_reason or normalized_reason in known_reasons:
+            return
+        detail = {
+            "timestamp": now_ist().isoformat(),
+            "reason": normalized_reason,
+        }
+        details.append(detail)
+        if len(details) > 50:
+            del details[:-50]
+        try:
+            save_state(state)
+        except Exception as exc:
+            log(
+                "STATE WRITE FAILURE while adding halt detail: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        journal_best_effort(
+            "HALT_DETAIL",
+            root_reason=root_reason,
+            reason=normalized_reason,
+        )
+        log(f"TRADING HALT DETAIL: {normalized_reason}")
+        return
+
     state["kill_switch"] = True
-    state["halt_reason"] = reason
-    if not was_halted:
-        state["kill_switch_flatten_attempts"] = 0
-        state["manual_intervention_required"] = False
+    state["halt_reason"] = normalized_reason
+    state["kill_switch_flatten_attempts"] = 0
+    state["manual_intervention_required"] = False
     try:
         save_state(state)
     except Exception as exc:
         log(f"STATE WRITE FAILURE while halting: {type(exc).__name__}: {exc}")
-    journal_best_effort("HALT", reason=reason)
-    log(f"TRADING HALTED: {reason}")
+    journal_best_effort("HALT", reason=normalized_reason)
+    log(f"TRADING HALTED: {normalized_reason}")
 
 
 def paper_fill_price(
@@ -5472,8 +5767,33 @@ def mark_trade_closed(
     data = state["trades"].get(symbol)
     if not data:
         return False
+    if str(data.get("status", "")).upper().startswith("CLOSED"):
+        # Broker/order callbacks and startup reconciliation are retryable.  A
+        # closure already committed to state must never be accounted twice.
+        return False
 
     trade = trade_from_dict(data)
+    try:
+        prior_realized_pnl = strict_finite_float(
+            state.get("realized_pnl"),
+            field="state.realized_pnl",
+        )
+        prior_fees_paid = strict_finite_float(
+            state.get("fees_paid"),
+            field="state.fees_paid",
+        )
+        prior_consecutive_losses = state.get("consecutive_losses")
+        if (
+            isinstance(prior_consecutive_losses, bool)
+            or not isinstance(prior_consecutive_losses, int)
+            or prior_consecutive_losses < 0
+        ):
+            raise ValueError("state.consecutive_losses must be non-negative")
+    except ValueError as exc:
+        detail = f"{symbol} closure accounting refused: {exc}"
+        halt_trading(state, detail)
+        raise RuntimeError(detail) from exc
+
     accounting_before = {
         key: state.get(key)
         for key in (
@@ -5497,23 +5817,35 @@ def mark_trade_closed(
     ):
         trade.status = "CLOSED_UNPRICED"
         trade.exit_status = "FLAT_PRICE_UNRESOLVED"
-        state["kill_switch"] = True
-        state["halt_reason"] = (
-            f"{symbol} is flat but its actual exit price is unresolved"
+        halt_trading(
+            state,
+            f"{symbol} is flat but its actual exit price is unresolved",
         )
-        persist_trade(state, trade)
-        journal_best_effort(
-            "CLOSE",
-            symbol=symbol,
-            idea_id=trade.idea_id,
-            ai_review_idea_id=trade.ai_review_idea_id,
-            reason=reason,
-            ai_mode=trade.ai_mode or AI_MODE,
-            ai_decision=trade.ai_decision,
-            execution_mode=trade.execution_mode or current_execution_mode(),
-            pricing_status="UNRESOLVED",
-            accounting_note=trade.accounting_note,
-        )
+        try:
+            close_event = prepare_journal_event(
+                "CLOSE",
+                symbol=symbol,
+                idea_id=trade.idea_id,
+                ai_review_idea_id=trade.ai_review_idea_id,
+                reason=reason,
+                ai_mode=trade.ai_mode or AI_MODE,
+                ai_decision=trade.ai_decision,
+                pricing_status="UNRESOLVED",
+                accounting_note=trade.accounting_note,
+                entry_order_id=trade.entry_order_id,
+                exit_order_ids=trade.exit_order_ids,
+            )
+            flushed = persist_trade_with_journal_event(state, trade, close_event)
+        except Exception:
+            halt_trading(
+                state,
+                f"{symbol} unpriced closure could not be persisted",
+            )
+            raise
+        if not flushed:
+            log(
+                f"{symbol}: unpriced CLOSE event remains in durable journal outbox"
+            )
         return True
 
     trade.exit_price = float(exit_price)
@@ -5535,6 +5867,19 @@ def mark_trade_closed(
         else estimate_nse_equity_intraday_cost(exit_turnover, entry_turnover)
     )
     trade.fees = float(costs.total)
+    trade.fees_source = "model_estimate"
+    trade.fee_model_version = NSE_EQUITY_INTRADAY_FEE_MODEL_VERSION
+    trade.fee_breakdown = {
+        "brokerage": float(costs.brokerage),
+        "stt": float(costs.stt),
+        "exchange_transaction_charges": float(
+            costs.exchange_transaction_charges
+        ),
+        "sebi_charges": float(costs.sebi_charges),
+        "stamp_duty": float(costs.stamp_duty),
+        "ipft_charges": float(costs.ipft_charges),
+        "gst": float(costs.gst),
+    }
     trade.net_pnl = trade.gross_pnl - trade.fees
     risk_amount = (
         trade.planned_risk_amount
@@ -5543,64 +5888,72 @@ def mark_trade_closed(
     )
     trade.r_multiple = trade.net_pnl / risk_amount if risk_amount > 0 else 0.0
 
-    state["realized_pnl"] = safe_float(state.get("realized_pnl")) + trade.net_pnl
-    state["fees_paid"] = safe_float(state.get("fees_paid")) + trade.fees
+    state["realized_pnl"] = math.fsum((prior_realized_pnl, trade.net_pnl))
+    state["fees_paid"] = math.fsum((prior_fees_paid, trade.fees))
     if trade.net_pnl < 0:
-        state["consecutive_losses"] = int(state.get("consecutive_losses", 0)) + 1
+        state["consecutive_losses"] = prior_consecutive_losses + 1
     else:
         state["consecutive_losses"] = 0
 
-    if state["realized_pnl"] <= -(CAPITAL_LIMIT * MAX_DAILY_LOSS_PCT):
+    if (
+        state["realized_pnl"] <= -(CAPITAL_LIMIT * MAX_DAILY_LOSS_PCT)
+        and not state.get("kill_switch")
+    ):
         state["kill_switch"] = True
         state["halt_reason"] = "realized daily loss limit reached"
-    if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+    if (
+        state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES
+        and not state.get("kill_switch")
+    ):
         state["kill_switch"] = True
         state["halt_reason"] = "consecutive loss limit reached"
 
     try:
-        persist_trade(state, trade)
+        close_event = prepare_journal_event(
+            "CLOSE",
+            symbol=symbol,
+            idea_id=trade.idea_id,
+            ai_review_idea_id=trade.ai_review_idea_id,
+            side=trade.side,
+            qty=trade.qty,
+            reason=reason,
+            entry_price=trade.entry_price,
+            exit_price=trade.exit_price,
+            gross_pnl=trade.gross_pnl,
+            fees=trade.fees,
+            fees_source=trade.fees_source,
+            fee_model_version=trade.fee_model_version,
+            fee_breakdown=trade.fee_breakdown,
+            fee_estimate_limitations=(
+                "uses aggregate average fills; contract note is authoritative"
+            ),
+            net_pnl=trade.net_pnl,
+            r_multiple=trade.r_multiple,
+            kill_switch=state.get("kill_switch", False),
+            halt_reason=state.get("halt_reason", ""),
+            ai_mode=trade.ai_mode or AI_MODE,
+            ai_decision=trade.ai_decision,
+            ai_valid=trade.ai_valid,
+            ai_error=trade.ai_error,
+            ai_response_model=trade.ai_response_model,
+            ai_response_id=trade.ai_response_id,
+            ai_prompt_version=trade.ai_prompt_version,
+            ai_decision_id=trade.ai_decision_id,
+            ai_input_sha256=trade.ai_input_sha256,
+            ai_input_tokens=trade.ai_input_tokens,
+            ai_output_tokens=trade.ai_output_tokens,
+            ai_total_tokens=trade.ai_total_tokens,
+            entry_order_id=trade.entry_order_id,
+            exit_order_ids=trade.exit_order_ids,
+        )
+        flushed = persist_trade_with_journal_event(state, trade, close_event)
     except Exception:
         for key, value in accounting_before.items():
             state[key] = value
-        state["kill_switch"] = True
-        state["halt_reason"] = (
-            f"{symbol} closure accounting could not be persisted"
-        )
-        try:
-            save_state(state)
-        except Exception:
-            pass
+        halt_trading(state, f"{symbol} closure accounting could not be persisted")
         raise
-    journal_best_effort(
-        "CLOSE",
-        symbol=symbol,
-        idea_id=trade.idea_id,
-        ai_review_idea_id=trade.ai_review_idea_id,
-        side=trade.side,
-        qty=trade.qty,
-        reason=reason,
-        entry_price=trade.entry_price,
-        exit_price=trade.exit_price,
-        gross_pnl=trade.gross_pnl,
-        fees=trade.fees,
-        net_pnl=trade.net_pnl,
-        r_multiple=trade.r_multiple,
-        ai_mode=trade.ai_mode or AI_MODE,
-        ai_decision=trade.ai_decision,
-        ai_valid=trade.ai_valid,
-        ai_error=trade.ai_error,
-        ai_response_model=trade.ai_response_model,
-        ai_response_id=trade.ai_response_id,
-        ai_prompt_version=trade.ai_prompt_version,
-        ai_decision_id=trade.ai_decision_id,
-        ai_input_sha256=trade.ai_input_sha256,
-        ai_input_tokens=trade.ai_input_tokens,
-        ai_output_tokens=trade.ai_output_tokens,
-        ai_total_tokens=trade.ai_total_tokens,
-        execution_mode=trade.execution_mode or current_execution_mode(),
-        entry_order_id=trade.entry_order_id,
-        exit_order_ids=trade.exit_order_ids,
-    )
+    if not flushed:
+        log(f"{symbol}: CLOSE event remains in durable journal outbox")
     return True
 
 
@@ -7738,6 +8091,11 @@ def _run_main() -> None:
 
     try:
         state = load_state()
+        if not flush_journal_outbox(state):
+            halt_trading(
+                state,
+                "durable journal outbox replay failed; refusing new entries",
+            )
         broker = KiteBroker()
         reconcile_startup(broker, state)
         broker.start_market_data()

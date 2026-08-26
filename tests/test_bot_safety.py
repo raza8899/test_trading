@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import threading
@@ -774,6 +775,88 @@ class StateSafetyTests(IsolatedBotTestCase):
 
         self.assertEqual(state["trades"][existing.symbol]["status"], "OPEN_PROTECTED")
 
+    def test_negative_consecutive_losses_refuses_to_start(self) -> None:
+        state = bot.fresh_state()
+        state["consecutive_losses"] = -1
+        bot.save_state(state)
+
+        with self.assertRaisesRegex(RuntimeError, "consecutive_losses"):
+            bot.load_state()
+
+    def test_state_totals_must_match_persisted_closed_trades(self) -> None:
+        state = bot.fresh_state()
+        trade = make_trade(status="CLOSED_TARGET")
+        trade.execution_mode = "paper"
+        trade.gross_pnl = 30.0
+        trade.fees = 5.0
+        trade.net_pnl = 25.0
+        state["trades"][trade.symbol] = asdict(trade)
+        state["realized_pnl"] = 0.0
+        state["fees_paid"] = 0.0
+        bot.save_state(state)
+
+        with self.assertRaisesRegex(RuntimeError, "realized_pnl"):
+            bot.load_state()
+
+    def test_previous_date_preserves_pending_journal_outbox(self) -> None:
+        previous_day = FIXED_NOW.replace(day=10)
+        with mock.patch.object(bot, "now_ist", return_value=previous_day):
+            state = bot.fresh_state()
+            state["journal_outbox"].append(
+                bot.prepare_journal_event("CLOSE", symbol="INFY")
+            )
+        bot.save_state(state)
+
+        loaded = bot.load_state()
+
+        self.assertEqual(loaded["date"], str(FIXED_NOW.date()))
+        self.assertEqual(len(loaded["journal_outbox"]), 1)
+        self.assertTrue(bot.flush_journal_outbox(loaded))
+        self.assertEqual(loaded["journal_outbox"], [])
+        self.assertTrue((self.log_directory / "trades_20260810.jsonl").exists())
+
+
+class JournalIntegrityTests(IsolatedBotTestCase):
+    def test_journal_uses_one_timestamp_and_stable_session_sequence(self) -> None:
+        first_time = FIXED_NOW.replace(hour=23, minute=59, second=59)
+        second_time = first_time.replace(day=12, hour=0, minute=0, second=0)
+        with mock.patch.object(
+            bot,
+            "now_ist",
+            side_effect=[first_time, second_time],
+        ) as clock:
+            first_id = bot.journal("FIRST")
+            second_id = bot.journal("SECOND")
+
+        self.assertEqual(clock.call_count, 2)
+        first_path = self.log_directory / "trades_20260811.jsonl"
+        second_path = self.log_directory / "trades_20260812.jsonl"
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        second = json.loads(second_path.read_text(encoding="utf-8"))
+        self.assertEqual(first["event_id"], first_id)
+        self.assertEqual(second["event_id"], second_id)
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(first["session_id"], second["session_id"])
+        self.assertEqual(second["event_sequence"], first["event_sequence"] + 1)
+        self.assertEqual(first_path.stat().st_mode & 0o777, 0o600)
+
+    def test_repeated_halt_reasons_are_suppressed_but_details_are_kept(self) -> None:
+        state = bot.fresh_state()
+
+        bot.halt_trading(state, "root failure")
+        bot.halt_trading(state, "root failure")
+        bot.halt_trading(state, "follow-on failure")
+        bot.halt_trading(state, "follow-on failure")
+
+        self.assertEqual(state["halt_reason"], "root failure")
+        self.assertEqual(
+            [detail["reason"] for detail in state["halt_details"]],
+            ["follow-on failure"],
+        )
+        path = self.log_directory / "trades_20260811.jsonl"
+        events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+        self.assertEqual(events, ["HALT", "HALT_DETAIL"])
+
 
 class PaperExecutionLifecycleTests(IsolatedBotTestCase):
     def test_post_fill_notional_breach_invokes_fail_safe(self) -> None:
@@ -860,6 +943,79 @@ class PaperExecutionLifecycleTests(IsolatedBotTestCase):
         self.assertAlmostEqual(state["realized_pnl"], closed.net_pnl)
         self.assertEqual(state["consecutive_losses"], 0)
         self.assertEqual(bot.open_trade_count(state), 0)
+
+    def test_close_is_idempotent_and_failed_journal_replays_from_outbox(self) -> None:
+        state = bot.fresh_state()
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "paper"
+        trade.ai_decision = "APPROVE"
+        state["trades"][trade.symbol] = asdict(trade)
+
+        with mock.patch.object(
+            bot,
+            "append_prepared_journal_event",
+            side_effect=OSError("disk full"),
+        ):
+            self.assertTrue(
+                bot.mark_trade_closed(
+                    state,
+                    trade.symbol,
+                    "TARGET",
+                    exit_price=103.0,
+                )
+            )
+
+        first_realized = state["realized_pnl"]
+        closed = bot.trade_from_dict(state["trades"][trade.symbol])
+        self.assertEqual(len(state["journal_outbox"]), 1)
+        self.assertEqual(closed.fees_source, "model_estimate")
+        self.assertEqual(
+            closed.fee_model_version,
+            bot.NSE_EQUITY_INTRADAY_FEE_MODEL_VERSION,
+        )
+        self.assertTrue(closed.fee_breakdown)
+        self.assertFalse(
+            bot.mark_trade_closed(
+                state,
+                trade.symbol,
+                "TARGET",
+                exit_price=103.0,
+            )
+        )
+        self.assertEqual(state["realized_pnl"], first_realized)
+
+        self.assertTrue(bot.flush_journal_outbox(state))
+        self.assertEqual(state["journal_outbox"], [])
+        path = self.log_directory / "trades_20260811.jsonl"
+        close_events = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line)["event"] == "CLOSE"
+        ]
+        self.assertEqual(len(close_events), 1)
+        self.assertEqual(close_events[0]["fees_source"], "model_estimate")
+
+    def test_close_refuses_corrupt_prior_accounting_instead_of_zeroing_it(self) -> None:
+        state = bot.fresh_state()
+        trade = make_trade(status="OPEN_PROTECTED")
+        trade.execution_mode = "paper"
+        state["trades"][trade.symbol] = asdict(trade)
+        state["realized_pnl"] = "corrupt"
+
+        with self.assertRaisesRegex(RuntimeError, "accounting refused"):
+            bot.mark_trade_closed(
+                state,
+                trade.symbol,
+                "TARGET",
+                exit_price=103.0,
+            )
+
+        self.assertTrue(state["kill_switch"])
+        self.assertEqual(
+            state["trades"][trade.symbol]["status"],
+            "OPEN_PROTECTED",
+        )
+        self.assertEqual(state["journal_outbox"], [])
 
     def test_quote_failure_closes_unpriced_instead_of_using_target(self) -> None:
         broker, state, _ = self._open_paper_trade()

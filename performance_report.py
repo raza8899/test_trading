@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Report realised and shadow performance from the bot's JSONL journals.
 
-Only CLOSE events with explicit, finite ``net_pnl``, ``gross_pnl``, ``fees``,
-and ``r_multiple`` are included.  They must also have a recognised
+Only CLOSE events with explicit, finite, arithmetically consistent ``net_pnl``,
+``gross_pnl``, non-negative ``fees``, and ``r_multiple`` are included.  They
+must also have a recognised
 ``ai_decision`` (``APPROVE``, ``REJECT``, ``ERROR``, or ``OFF``), except that a missing
 decision is accepted when ``ai_mode`` is explicitly ``off``.  Older CLOSE
 events are reported as incomplete and excluded; this module never reconstructs
@@ -13,7 +14,8 @@ the append order of lexically sorted input paths, then line order within each
 file, matching the normal ``trades_YYYYMMDD.jsonl`` journal layout.  Provenance
 metadata is not required for legacy P&L to remain calculable, but reports mark
 mixed or unverifiable experiments explicitly rather than implying that their
-aggregate is a like-for-like comparison.
+aggregate is a like-for-like comparison.  Stable event IDs deduplicate outbox
+replays, and fee provenance distinguishes estimates from broker-confirmed data.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 LOG_PATTERN = "trades_*.jsonl"
 NUMERIC_FIELDS = ("net_pnl", "gross_pnl", "fees", "r_multiple")
+PNL_ABSOLUTE_TOLERANCE = 1e-6
 AI_COHORT_DECISIONS = ("APPROVE", "REJECT")
 VALID_AI_DECISIONS = (*AI_COHORT_DECISIONS, "ERROR", "OFF")
 
@@ -49,11 +52,14 @@ class TradeRecord:
     fees: float
     r_multiple: float
     ai_decision: str
+    event_id: str | None = None
     execution_mode: str | None = None
     config_fingerprint: str | None = None
     ai_mode: str | None = None
     ai_response_model: str | None = None
     ai_prompt_version: str | None = None
+    fees_source: str | None = None
+    fee_model_version: str | None = None
 
 
 @dataclass
@@ -67,6 +73,7 @@ class ParseDiagnostics:
     ignored_non_close_events: int = 0
     close_events: int = 0
     complete_close_events: int = 0
+    duplicate_close_events: int = 0
     incomplete_close_events: int = 0
     incomplete_reasons: Counter[str] = field(default_factory=Counter)
     file_errors: list[str] = field(default_factory=list)
@@ -80,6 +87,7 @@ class ParseDiagnostics:
             "ignored_non_close_events": self.ignored_non_close_events,
             "close_events": self.close_events,
             "complete_close_events": self.complete_close_events,
+            "duplicate_close_events": self.duplicate_close_events,
             "incomplete_close_events": self.incomplete_close_events,
             "incomplete_reasons": dict(sorted(self.incomplete_reasons.items())),
             "file_errors": list(self.file_errors),
@@ -130,6 +138,27 @@ def _close_event_to_trade(
             continue
         numbers[name] = value
 
+    if "fees" in numbers and numbers["fees"] < 0:
+        issues.append("invalid_field:fees_negative")
+    has_pnl_components = all(
+        name in numbers for name in ("net_pnl", "gross_pnl", "fees")
+    )
+    if has_pnl_components and not math.isclose(
+        numbers["net_pnl"],
+        numbers["gross_pnl"] - numbers["fees"],
+        rel_tol=0.0,
+        abs_tol=PNL_ABSOLUTE_TOLERANCE,
+    ):
+        issues.append("inconsistent_pnl_arithmetic")
+
+    event_id: str | None = None
+    if "event_id" in payload:
+        raw_event_id = payload["event_id"]
+        if not isinstance(raw_event_id, str) or not raw_event_id.strip():
+            issues.append("invalid_field:event_id")
+        else:
+            event_id = raw_event_id.strip()
+
     if "ai_decision" not in payload or payload["ai_decision"] is None:
         ai_mode = payload.get("ai_mode")
         if isinstance(ai_mode, str) and ai_mode.strip().lower() == "off":
@@ -157,6 +186,7 @@ def _close_event_to_trade(
             fees=numbers["fees"],
             r_multiple=numbers["r_multiple"],
             ai_decision=decision,
+            event_id=event_id,
             execution_mode=_optional_text(
                 payload,
                 "execution_mode",
@@ -170,6 +200,8 @@ def _close_event_to_trade(
                 "ai_model",
             ),
             ai_prompt_version=_optional_text(payload, "ai_prompt_version"),
+            fees_source=_optional_text(payload, "fees_source", lowercase=True),
+            fee_model_version=_optional_text(payload, "fee_model_version"),
         ),
         [],
     )
@@ -180,6 +212,7 @@ def parse_trade_files(paths: Iterable[Path]) -> tuple[list[TradeRecord], ParseDi
 
     trades: list[TradeRecord] = []
     diagnostics = ParseDiagnostics()
+    seen_close_event_ids: set[str] = set()
 
     for path in sorted(paths, key=lambda item: str(item)):
         try:
@@ -206,6 +239,13 @@ def parse_trade_files(paths: Iterable[Path]) -> tuple[list[TradeRecord], ParseDi
                         continue
 
                     diagnostics.close_events += 1
+                    raw_event_id = payload.get("event_id")
+                    if isinstance(raw_event_id, str) and raw_event_id.strip():
+                        event_id = raw_event_id.strip()
+                        if event_id in seen_close_event_ids:
+                            diagnostics.duplicate_close_events += 1
+                            continue
+                        seen_close_event_ids.add(event_id)
                     trade, issues = _close_event_to_trade(payload, path, line_number)
                     if trade is None:
                         diagnostics.incomplete_close_events += 1
@@ -277,6 +317,37 @@ def summarize_trades(records: Sequence[TradeRecord]) -> dict[str, Any]:
     }
 
 
+def summarize_experiment_cohorts(
+    records: Sequence[TradeRecord],
+) -> list[dict[str, Any]]:
+    """Keep live/paper and config variants out of a single comparison cohort."""
+    grouped: dict[tuple[str | None, str | None], list[TradeRecord]] = {}
+    for record in records:
+        key = (record.execution_mode, record.config_fingerprint)
+        grouped.setdefault(key, []).append(record)
+    return [
+        {
+            "execution_mode": mode,
+            "config_fingerprint": fingerprint,
+            "verified_identity": mode is not None and fingerprint is not None,
+            "summary": summarize_trades(group),
+            "ai_shadow_cohorts": {
+                decision: summarize_trades(
+                    [record for record in group if record.ai_decision == decision]
+                )
+                for decision in (*AI_COHORT_DECISIONS, "ERROR")
+            },
+        }
+        for (mode, fingerprint), group in sorted(
+            grouped.items(),
+            key=lambda item: (
+                item[0][0] or "",
+                item[0][1] or "",
+            ),
+        )
+    ]
+
+
 def _provenance_counts(
     records: Sequence[TradeRecord],
     field_name: str,
@@ -325,6 +396,27 @@ def summarize_provenance(records: Sequence[TradeRecord]) -> dict[str, Any]:
     else:
         compatibility_status = "compatible"
 
+    fee_sources = _provenance_counts(records, "fees_source")
+    fee_models = _provenance_counts(records, "fee_model_version")
+    missing_fee_source = sum(record.fees_source is None for record in records)
+    missing_fee_model = sum(record.fee_model_version is None for record in records)
+    estimated_fee_records = sum(
+        record.fees_source == "model_estimate" for record in records
+    )
+    broker_confirmed_fee_records = sum(
+        record.fees_source in {"broker", "contract_note"} for record in records
+    )
+    if not count:
+        fee_status = "unknown_no_records"
+    elif missing_fee_source or missing_fee_model:
+        fee_status = "unverified"
+    elif estimated_fee_records == count:
+        fee_status = "estimated"
+    elif broker_confirmed_fee_records == count:
+        fee_status = "broker_confirmed"
+    else:
+        fee_status = "mixed"
+
     ai_records = [record for record in records if record.ai_decision != "OFF"]
     ai_response_models = _provenance_counts(ai_records, "ai_response_model")
     ai_prompt_versions = _provenance_counts(ai_records, "ai_prompt_version")
@@ -363,6 +455,15 @@ def summarize_provenance(records: Sequence[TradeRecord]) -> dict[str, Any]:
         "missing_execution_mode": missing_execution_mode,
         "missing_config_fingerprint": missing_config_fingerprint,
         "unrecognized_execution_modes": unknown_execution_modes,
+        "fees": {
+            "compatibility_status": fee_status,
+            "sources": fee_sources,
+            "models": fee_models,
+            "missing_source": missing_fee_source,
+            "missing_model": missing_fee_model,
+            "estimated_records": estimated_fee_records,
+            "broker_confirmed_records": broker_confirmed_fee_records,
+        },
         "ai": {
             "record_count": len(ai_records),
             "compatibility_status": ai_status,
@@ -423,6 +524,26 @@ def provenance_warnings(provenance: dict[str, Any]) -> list[str]:
             "record(s) are missing or have invalid config_fingerprint metadata; "
             "legacy P&L remains included, but configuration compatibility is "
             "unverified."
+        )
+
+    fees = provenance["fees"]
+    if fees["estimated_records"]:
+        warnings.append(
+            "Fee warning: "
+            f"{fees['estimated_records']} of {count} complete CLOSE record(s) use "
+            "model-estimated charges; broker contract notes remain authoritative."
+        )
+    if fees["missing_source"]:
+        warnings.append(
+            "Fee provenance warning: "
+            f"{fees['missing_source']} of {count} complete CLOSE record(s) do not "
+            "identify whether fees are estimated or broker-confirmed."
+        )
+    if fees["missing_model"]:
+        warnings.append(
+            "Fee provenance warning: "
+            f"{fees['missing_model']} of {count} complete CLOSE record(s) lack a "
+            "fee-model version."
         )
 
     ai = provenance["ai"]
@@ -502,6 +623,11 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
             f"Excluded {diagnostics.incomplete_close_events} incomplete or legacy CLOSE event(s); "
             "no P&L values were inferred."
         )
+    if diagnostics.duplicate_close_events:
+        warnings.append(
+            f"Deduplicated {diagnostics.duplicate_close_events} replayed CLOSE "
+            "event(s) by stable event_id."
+        )
     invalid_lines = diagnostics.malformed_json_lines + diagnostics.non_object_lines
     if invalid_lines:
         warnings.append(f"Ignored {invalid_lines} malformed or non-object JSONL record(s).")
@@ -516,7 +642,13 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
         "drawdown_order": "lexically sorted source path, then JSONL line number",
         "diagnostics": diagnostics.as_dict(),
         "provenance": provenance,
+        "summary_scope": (
+            "cross_experiment_aggregate_not_comparable"
+            if provenance["compatibility_status"] == "incompatible_mixed"
+            else "single_or_unverified_experiment"
+        ),
         "summary": summarize_trades(records),
+        "experiment_cohorts": summarize_experiment_cohorts(records),
         "ai_shadow_cohorts": {
             "APPROVE": summarize_trades(approve),
             "REJECT": summarize_trades(reject),
@@ -560,16 +692,23 @@ def format_text_report(report: dict[str, Any]) -> str:
     diagnostics = report["diagnostics"]
     provenance = report["provenance"]
     ai_provenance = provenance["ai"]
+    fee_provenance = provenance["fees"]
     lines = [
         "Intraday bot performance report",
         f"Files: {len(report['files'])}",
         f"Complete CLOSE records: {diagnostics['complete_close_events']}",
+        f"Duplicate CLOSE replays excluded: {diagnostics['duplicate_close_events']}",
         f"Incomplete/legacy CLOSE records excluded: {diagnostics['incomplete_close_events']}",
         f"Provenance compatibility: {provenance['compatibility_status']}",
         "Execution modes: "
         + (_counted_values(provenance["execution_modes"]) or "none recorded"),
         "Config fingerprints: "
         + (_counted_values(provenance["config_fingerprints"]) or "none recorded"),
+        f"Fee provenance: {fee_provenance['compatibility_status']}",
+        "Fee sources: "
+        + (_counted_values(fee_provenance["sources"]) or "none recorded"),
+        "Fee models: "
+        + (_counted_values(fee_provenance["models"]) or "none recorded"),
         f"AI provenance compatibility: {ai_provenance['compatibility_status']}",
         "AI response models: "
         + (_counted_values(ai_provenance["response_models"]) or "none recorded"),
@@ -577,13 +716,50 @@ def format_text_report(report: dict[str, Any]) -> str:
         + (_counted_values(ai_provenance["prompt_versions"]) or "none recorded"),
         "",
     ]
-    lines.extend(_summary_lines("Overall", report["summary"]))
+    overall_title = (
+        "Overall (cross-experiment aggregate; not comparable)"
+        if report["summary_scope"] == "cross_experiment_aggregate_not_comparable"
+        else "Overall"
+    )
+    lines.extend(_summary_lines(overall_title, report["summary"]))
+    for index, cohort in enumerate(report["experiment_cohorts"], start=1):
+        lines.append("")
+        identity = (
+            f"mode={cohort['execution_mode'] or 'unknown'}, "
+            f"config={cohort['config_fingerprint'] or 'unknown'}"
+        )
+        lines.extend(
+            _summary_lines(
+                f"Experiment cohort {index} ({identity})",
+                cohort["summary"],
+            )
+        )
     lines.append("")
-    lines.extend(_summary_lines("AI APPROVE cohort", report["ai_shadow_cohorts"]["APPROVE"]))
+    ai_scope = (
+        " (cross-experiment aggregate; not comparable)"
+        if report["summary_scope"] == "cross_experiment_aggregate_not_comparable"
+        else ""
+    )
+    lines.extend(
+        _summary_lines(
+            f"AI APPROVE cohort{ai_scope}",
+            report["ai_shadow_cohorts"]["APPROVE"],
+        )
+    )
     lines.append("")
-    lines.extend(_summary_lines("AI REJECT shadow cohort", report["ai_shadow_cohorts"]["REJECT"]))
+    lines.extend(
+        _summary_lines(
+            f"AI REJECT shadow cohort{ai_scope}",
+            report["ai_shadow_cohorts"]["REJECT"],
+        )
+    )
     lines.append("")
-    lines.extend(_summary_lines("AI ERROR/unavailable cohort", report["ai_shadow_cohorts"]["ERROR"]))
+    lines.extend(
+        _summary_lines(
+            f"AI ERROR/unavailable cohort{ai_scope}",
+            report["ai_shadow_cohorts"]["ERROR"],
+        )
+    )
 
     if diagnostics["incomplete_reasons"]:
         lines.extend(("", "Excluded CLOSE reasons:"))

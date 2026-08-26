@@ -224,6 +224,8 @@ class PerformanceReportTests(unittest.TestCase):
                         "config_fingerprint": "config-a",
                         "ai_response_model": "gpt-test-1",
                         "ai_prompt_version": "prompt-v1",
+                        "fees_source": "contract_note",
+                        "fee_model_version": "broker-20260811",
                     }
                 ],
             )
@@ -265,6 +267,7 @@ class PerformanceReportTests(unittest.TestCase):
                     {
                         **base,
                         "net_pnl": -5,
+                        "gross_pnl": -4,
                         "execution_mode": "live",
                         "config_fingerprint": "config-b",
                         "ai_response_model": "gpt-test-2",
@@ -277,6 +280,11 @@ class PerformanceReportTests(unittest.TestCase):
             provenance = report["provenance"]
 
             self.assertEqual(report["summary"]["trades"], 2)
+            self.assertEqual(
+                report["summary_scope"],
+                "cross_experiment_aggregate_not_comparable",
+            )
+            self.assertEqual(len(report["experiment_cohorts"]), 2)
             self.assertEqual(provenance["compatibility_status"], "incompatible_mixed")
             self.assertFalse(provenance["compatible"])
             self.assertEqual(provenance["execution_modes"], {"live": 1, "paper": 1})
@@ -298,6 +306,62 @@ class PerformanceReportTests(unittest.TestCase):
                 any("mixed response models" in warning for warning in report["warnings"])
             )
             self.assertIn("Provenance compatibility: incompatible_mixed", performance_report.format_text_report(report))
+
+    def test_invalid_pnl_arithmetic_and_negative_fees_are_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 10,
+                        "gross_pnl": 12,
+                        "fees": -2,
+                        "r_multiple": 0.5,
+                        "ai_decision": "APPROVE",
+                    },
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 50,
+                        "gross_pnl": 12,
+                        "fees": 2,
+                        "r_multiple": 0.5,
+                        "ai_decision": "APPROVE",
+                    },
+                ],
+            )
+
+            report = performance_report.build_report([path])
+            reasons = report["diagnostics"]["incomplete_reasons"]
+
+            self.assertEqual(report["summary"]["trades"], 0)
+            self.assertEqual(reasons["invalid_field:fees_negative"], 1)
+            self.assertEqual(reasons["inconsistent_pnl_arithmetic"], 2)
+
+    def test_replayed_close_event_is_deduplicated_by_event_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            close = {
+                "event": "CLOSE",
+                "event_id": "close-1",
+                "net_pnl": 10,
+                "gross_pnl": 12,
+                "fees": 2,
+                "r_multiple": 0.5,
+                "ai_decision": "APPROVE",
+            }
+            write_jsonl(path, [close, close])
+
+            report = performance_report.build_report([path])
+
+            self.assertEqual(report["diagnostics"]["close_events"], 2)
+            self.assertEqual(report["diagnostics"]["complete_close_events"], 1)
+            self.assertEqual(report["diagnostics"]["duplicate_close_events"], 1)
+            self.assertEqual(report["summary"]["trades"], 1)
+            self.assertTrue(
+                any("Deduplicated 1" in warning for warning in report["warnings"])
+            )
 
     def test_complete_legacy_records_remain_calculable_but_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -376,12 +376,18 @@ def _decimal(value: Any, *, field: str) -> Decimal:
 
 @dataclass(frozen=True, slots=True)
 class NSEEquityIntradayRates:
-    """Configurable Zerodha NSE equity-intraday rates as of 2026-08-11."""
+    """Configurable Zerodha NSE equity-intraday rates from 2026-03-01.
+
+    NSE's published cash-market total of Rs. 307/crore is composed of
+    Rs. 306.99/crore transaction charges and Rs. 0.01/crore IPFT.  Keeping the
+    two components separate avoids counting IPFT twice while retaining an
+    auditable charge breakdown.
+    """
 
     brokerage_rate: Decimal = Decimal("0.0003")
     brokerage_cap_per_order: Decimal = Decimal("20")
     stt_sell_rate: Decimal = Decimal("0.00025")
-    exchange_transaction_rate: Decimal = Decimal("0.0000307")
+    exchange_transaction_rate: Decimal = Decimal("0.000030699")
     sebi_rate: Decimal = Decimal("0.000001")
     stamp_buy_rate: Decimal = Decimal("0.00003")
     ipft_rate: Decimal = Decimal("0.000000001")
@@ -397,6 +403,9 @@ class NSEEquityIntradayRates:
 
 
 DEFAULT_NSE_EQUITY_INTRADAY_RATES = NSEEquityIntradayRates()
+NSE_EQUITY_INTRADAY_FEE_MODEL_VERSION = (
+    "zerodha-nse-equity-intraday-estimate-20260301"
+)
 
 
 @dataclass(frozen=True, slots=True)
