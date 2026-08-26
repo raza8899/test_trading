@@ -110,8 +110,8 @@ AI_MODE = os.getenv("AI_MODE", "off").strip().lower()
 AI_IDEA_MODE = os.getenv("AI_IDEA_MODE", "shadow").strip().lower()
 AI_IDEA_MAX_CANDIDATES = int(os.getenv("AI_IDEA_MAX_CANDIDATES", "8"))
 MAX_AI_REVIEWS_PER_SCAN = int(os.getenv("MAX_AI_REVIEWS_PER_SCAN", "3"))
-AI_PROMPT_VERSION = "nse-orb-review-v3"
-AI_IDEA_PROMPT_VERSION = "nse-candidate-ideas-v1"
+AI_PROMPT_VERSION = "nse-orb-review-v4"
+AI_IDEA_PROMPT_VERSION = "nse-candidate-ideas-v2"
 
 # Safety switch
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -158,6 +158,7 @@ MAX_GAP_PCT = float(os.getenv("MAX_GAP_PCT", "8.0"))
 
 # Setup filters
 MIN_RVOL = float(os.getenv("MIN_RVOL", "1.35"))
+MIN_OPENING_RVOL = float(os.getenv("MIN_OPENING_RVOL", "1.0"))
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0025"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.025"))
 MAX_VWAP_DISTANCE_ATR = float(os.getenv("MAX_VWAP_DISTANCE_ATR", "1.8"))
@@ -167,6 +168,8 @@ MIN_BREAKOUT_DISTANCE_ATR = float(
 MAX_BREAKOUT_DISTANCE_ATR = float(
     os.getenv("MAX_BREAKOUT_DISTANCE_ATR", "0.80")
 )
+LONG_MIN_DAY_CHANGE_PCT = 0.30
+SHORT_MAX_DAY_CHANGE_PCT = -0.20
 
 # Trade construction
 ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.20"))
@@ -182,6 +185,9 @@ MAX_SIGNAL_AGE_SECONDS = int(
 )
 MAX_ENTRY_DRIFT_ATR = float(
     os.getenv("MAX_ENTRY_DRIFT_ATR", "0.30")
+)
+MAX_EXECUTION_QUOTE_AGE_SECONDS = int(
+    os.getenv("MAX_EXECUTION_QUOTE_AGE_SECONDS", "10")
 )
 ENTRY_FILL_TIMEOUT_SECONDS = float(
     os.getenv("ENTRY_FILL_TIMEOUT_SECONDS", "15")
@@ -228,6 +234,9 @@ ENTRY_CUTOFF_GUARD_SECONDS = int(
 # REST rate safety
 # Kite historical API = 3 req/sec. Stay slightly below it.
 CANDLE_DELAY_SECONDS = float(os.getenv("CANDLE_DELAY_SECONDS", "0.36"))
+CANDLE_CLOSE_GRACE_SECONDS = float(
+    os.getenv("CANDLE_CLOSE_GRACE_SECONDS", "2")
+)
 INDICATOR_LOOKBACK_DAYS = int(
     os.getenv("INDICATOR_LOOKBACK_DAYS", "21")
 )
@@ -262,7 +271,7 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.6-accounting-integrity-20260826"
+STRATEGY_VERSION = "3.7-causal-entry-quality-20260826"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
@@ -317,12 +326,17 @@ RUNTIME_MANIFEST: dict[str, Any] = {
     },
     "setup": {
         "min_rvol": MIN_RVOL,
+        "min_opening_rvol": MIN_OPENING_RVOL,
         "atr_pct": [MIN_ATR_PCT, MAX_ATR_PCT],
         "max_vwap_distance_atr": MAX_VWAP_DISTANCE_ATR,
         "breakout_atr": [
             MIN_BREAKOUT_DISTANCE_ATR,
             MAX_BREAKOUT_DISTANCE_ATR,
         ],
+        "directional_day_change_pct": {
+            "long_min": LONG_MIN_DAY_CHANGE_PCT,
+            "short_max": SHORT_MAX_DAY_CHANGE_PCT,
+        },
         "stop_atr": ATR_STOP_MULTIPLIER,
         "target_r": TARGET_R_MULTIPLE,
         "min_after_cost_payoff_ratio": MIN_AFTER_COST_PAYOFF_RATIO,
@@ -331,6 +345,7 @@ RUNTIME_MANIFEST: dict[str, Any] = {
     "execution": {
         "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
         "max_entry_drift_atr": MAX_ENTRY_DRIFT_ATR,
+        "max_execution_quote_age_seconds": MAX_EXECUTION_QUOTE_AGE_SECONDS,
         "entry_fill_timeout_seconds": ENTRY_FILL_TIMEOUT_SECONDS,
         "stop_arm_timeout_seconds": STOP_ARM_TIMEOUT_SECONDS,
         "exit_fill_timeout_seconds": EXIT_FILL_TIMEOUT_SECONDS,
@@ -354,6 +369,7 @@ RUNTIME_MANIFEST: dict[str, Any] = {
     },
     "data": {
         "candle_delay_seconds": CANDLE_DELAY_SECONDS,
+        "candle_close_grace_seconds": CANDLE_CLOSE_GRACE_SECONDS,
         "indicator_lookback_days": INDICATOR_LOOKBACK_DAYS,
         "ws_instruments_per_connection": WS_MAX_INSTRUMENTS_PER_CONNECTION,
         "ws_active_tick_max_age_seconds": WS_ACTIVE_TICK_MAX_AGE_SECONDS,
@@ -401,6 +417,7 @@ class Quote:
     lower_circuit_limit: float = 0.0
     upper_circuit_limit: float = 0.0
     stock_in_play_score: float = 0.0
+    observed_at: str = ""
 
 
 @dataclass
@@ -440,6 +457,12 @@ class Setup:
     signal_at: str
     lower_circuit_limit: float = 0.0
     upper_circuit_limit: float = 0.0
+    signal_price: float = 0.0
+    signal_bar_closed_at: str = ""
+    quote_observed_at: str = ""
+    setup_detected_at: str = ""
+    last_validated_at: str = ""
+    opening_rvol: float = 0.0
 
 
 @dataclass
@@ -646,6 +669,10 @@ def identifier_stripped_ai_payload(candidate: dict[str, Any]) -> dict[str, Any]:
         "symbol",
         "token",
         "signal_at",
+        "signal_bar_closed_at",
+        "quote_observed_at",
+        "setup_detected_at",
+        "last_validated_at",
         "technical_score",
         "stock_in_play_score",
     ):
@@ -914,14 +941,24 @@ def validate_configuration() -> None:
         errors.append("price bounds are invalid")
     if MIN_ATR_PCT <= 0 or MAX_ATR_PCT <= MIN_ATR_PCT:
         errors.append("ATR bounds are invalid")
+    if MIN_RVOL < 1 or MIN_OPENING_RVOL < 1:
+        errors.append("relative-volume thresholds must be at least 1")
+    if MAX_VWAP_DISTANCE_ATR <= 0:
+        errors.append("MAX_VWAP_DISTANCE_ATR must be positive")
+    if not 0 <= MIN_BREAKOUT_DISTANCE_ATR < MAX_BREAKOUT_DISTANCE_ATR:
+        errors.append("breakout-distance bounds are invalid")
     if not 0 < TARGET_R_MULTIPLE <= 10:
         errors.append("TARGET_R_MULTIPLE must be in (0, 10]")
     if not 0 < MIN_AFTER_COST_PAYOFF_RATIO <= 10:
         errors.append("MIN_AFTER_COST_PAYOFF_RATIO must be in (0, 10]")
     if not 0 <= CIRCUIT_HEADROOM_BPS <= 1000:
         errors.append("CIRCUIT_HEADROOM_BPS must be between 0 and 1000")
-    if MAX_SIGNAL_AGE_SECONDS <= 0 or MAX_ENTRY_DRIFT_ATR <= 0:
-        errors.append("signal freshness limits must be positive")
+    if not 0 < MAX_SIGNAL_AGE_SECONDS < 300 or MAX_ENTRY_DRIFT_ATR <= 0:
+        errors.append(
+            "signal freshness must be positive and shorter than one 5-minute bar"
+        )
+    if not 1 <= MAX_EXECUTION_QUOTE_AGE_SECONDS <= 60:
+        errors.append("execution quote age must be between 1 and 60 seconds")
     if min(
         ENTRY_FILL_TIMEOUT_SECONDS,
         STOP_ARM_TIMEOUT_SECONDS,
@@ -946,6 +983,8 @@ def validate_configuration() -> None:
         errors.append("MAX_WS_DISCONNECT_SECONDS must be positive")
     if INDICATOR_LOOKBACK_DAYS < 7:
         errors.append("INDICATOR_LOOKBACK_DAYS must be at least 7")
+    if not 0 <= CANDLE_CLOSE_GRACE_SECONDS <= 30:
+        errors.append("CANDLE_CLOSE_GRACE_SECONDS must be between 0 and 30")
     if not 0 <= ENTRY_CUTOFF_GUARD_SECONDS < 300:
         errors.append("ENTRY_CUTOFF_GUARD_SECONDS must be in [0, 300)")
 
@@ -960,6 +999,15 @@ def validate_configuration() -> None:
         "CIRCUIT_HEADROOM_BPS": CIRCUIT_HEADROOM_BPS,
         "PAPER_SLIPPAGE_BPS": PAPER_SLIPPAGE_BPS,
         "RISK_SLIPPAGE_BPS": RISK_SLIPPAGE_BPS,
+        "CANDLE_CLOSE_GRACE_SECONDS": CANDLE_CLOSE_GRACE_SECONDS,
+        "MIN_RVOL": MIN_RVOL,
+        "MIN_OPENING_RVOL": MIN_OPENING_RVOL,
+        "MIN_ATR_PCT": MIN_ATR_PCT,
+        "MAX_ATR_PCT": MAX_ATR_PCT,
+        "MAX_VWAP_DISTANCE_ATR": MAX_VWAP_DISTANCE_ATR,
+        "MIN_BREAKOUT_DISTANCE_ATR": MIN_BREAKOUT_DISTANCE_ATR,
+        "MAX_BREAKOUT_DISTANCE_ATR": MAX_BREAKOUT_DISTANCE_ATR,
+        "MAX_ENTRY_DRIFT_ATR": MAX_ENTRY_DRIFT_ATR,
     }
     if any(not math.isfinite(value) for value in finite_values.values()):
         errors.append("numeric risk configuration must be finite")
@@ -1582,9 +1630,35 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def market_timestamp(value: Any, *, field: str) -> pd.Timestamp:
+    """Normalize a broker/exchange timestamp to timezone-aware IST."""
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a valid timestamp") from exc
+    if pd.isna(timestamp):
+        raise ValueError(f"{field} must be a valid timestamp")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(IST)
+    else:
+        timestamp = timestamp.tz_convert(IST)
+    return timestamp
+
+
+def latest_eligible_5m_bar_start(as_of: Any) -> pd.Timestamp:
+    """Return the newest bar start whose full interval plus grace has elapsed."""
+    observed_at = market_timestamp(as_of, field="as_of")
+    effective_at = observed_at - pd.Timedelta(
+        seconds=CANDLE_CLOSE_GRACE_SECONDS
+    )
+    return effective_at.floor("5min") - pd.Timedelta(minutes=5)
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_values("date").reset_index(drop=True)
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.DatetimeIndex(
+        [market_timestamp(value, field="candle.date") for value in df["date"]]
+    )
 
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
@@ -1610,6 +1684,33 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["rvol"] = df["volume"] / baseline_volume.replace(0, np.nan)
 
+    # Opening-range volume is compared only with the same completed 15-minute
+    # window in earlier sessions. Partial or malformed opening windows never
+    # contribute to the baseline.
+    opening_times = {dtime(9, 15), dtime(9, 20), dtime(9, 25)}
+    opening_mask = df["date"].dt.time.isin(opening_times)
+    opening_rows = pd.DataFrame(
+        {
+            "session": session[opening_mask],
+            "volume": df.loc[opening_mask, "volume"],
+        }
+    )
+    opening_stats = opening_rows.groupby("session")["volume"].agg(
+        ["count", "sum"]
+    )
+    complete_opening_volume = opening_stats.loc[
+        opening_stats["count"] == 3,
+        "sum",
+    ]
+    opening_baseline = complete_opening_volume.shift(1).rolling(
+        window=14,
+        min_periods=5,
+    ).mean()
+    opening_rvol_by_session = (
+        complete_opening_volume / opening_baseline.replace(0, np.nan)
+    )
+    df["opening_rvol"] = session.map(opening_rvol_by_session)
+
     candle_range = (df["high"] - df["low"]).replace(0, np.nan)
     df["body_ratio"] = (
         (df["close"] - df["open"]).abs() / candle_range
@@ -1621,22 +1722,110 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def keep_only_closed_5m_candles(df: pd.DataFrame) -> pd.DataFrame:
+def keep_only_closed_5m_candles(
+    df: pd.DataFrame,
+    *,
+    as_of: Any | None = None,
+) -> pd.DataFrame:
+    """Exclude any bar not fully closed at the request's causal cutoff."""
     if df.empty:
         return df
 
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.DatetimeIndex(
+        [market_timestamp(value, field="candle.date") for value in df["date"]]
+    )
+    observed_at = market_timestamp(as_of or now_ist(), field="as_of")
+    closed_by = observed_at - pd.Timedelta(
+        seconds=CANDLE_CLOSE_GRACE_SECONDS
+    )
+    return df[
+        df["date"] + pd.Timedelta(minutes=5) <= closed_by
+    ].reset_index(drop=True)
 
-    now = pd.Timestamp.now(tz=IST)
-    bucket_start = now.floor("5min")
 
-    if df["date"].dt.tz is None:
-        df["date"] = df["date"].dt.tz_localize(IST)
-    else:
-        df["date"] = df["date"].dt.tz_convert(IST)
+def validated_strategy_candles(
+    df: pd.DataFrame,
+    *,
+    as_of: Any | None = None,
+) -> pd.DataFrame:
+    """Return a causal, contiguous current-session frame or an empty frame."""
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
 
-    return df[df["date"] < bucket_start].reset_index(drop=True)
+    try:
+        observed_at = market_timestamp(as_of or now_ist(), field="as_of")
+        normalized = df.copy()
+        normalized["date"] = pd.DatetimeIndex(
+            [
+                market_timestamp(value, field="candle.date")
+                for value in normalized["date"]
+            ]
+        )
+        for name in ("open", "high", "low", "close", "volume"):
+            normalized[name] = pd.to_numeric(normalized[name], errors="raise")
+    except (TypeError, ValueError):
+        return pd.DataFrame()
+
+    normalized = normalized.sort_values("date").reset_index(drop=True)
+    if normalized["date"].duplicated().any():
+        return pd.DataFrame()
+    if any(
+        not math.isfinite(float(value))
+        for name in ("open", "high", "low", "close", "volume")
+        for value in normalized[name]
+    ):
+        return pd.DataFrame()
+    if (
+        (normalized[["open", "high", "low", "close"]] <= 0).any().any()
+        or (normalized["volume"] < 0).any()
+        or (
+            normalized["high"]
+            < normalized[["open", "close", "low"]].max(axis=1)
+        ).any()
+        or (
+            normalized["low"]
+            > normalized[["open", "close", "high"]].min(axis=1)
+        ).any()
+    ):
+        return pd.DataFrame()
+
+    timestamps = normalized["date"]
+    if any(
+        timestamp.second != 0
+        or timestamp.microsecond != 0
+        or timestamp.minute % 5 != 0
+        for timestamp in timestamps
+    ):
+        return pd.DataFrame()
+
+    current = normalized[timestamps.dt.date == observed_at.date()].copy()
+    if current.empty:
+        return pd.DataFrame()
+    session_open = pd.Timestamp.combine(
+        observed_at.date(),
+        MARKET_OPEN,
+    ).tz_localize(IST)
+    session_last = (
+        pd.Timestamp.combine(observed_at.date(), SESSION_END).tz_localize(IST)
+        - pd.Timedelta(minutes=5)
+    )
+    expected_last = min(
+        latest_eligible_5m_bar_start(observed_at),
+        session_last,
+    )
+    if expected_last < session_open:
+        return pd.DataFrame()
+    expected = pd.date_range(
+        session_open,
+        expected_last,
+        freq="5min",
+    )
+    actual = pd.DatetimeIndex(current["date"])
+    if not actual.equals(expected):
+        return pd.DataFrame()
+    return normalized
 
 
 # =============================================================================
@@ -1650,6 +1839,7 @@ class LiveTickStore:
 
     def update_many(self, ticks: list[dict]) -> None:
         received_at = time.monotonic()
+        received_at_iso = now_ist().isoformat()
 
         with self._lock:
             for tick in ticks:
@@ -1657,6 +1847,7 @@ class LiveTickStore:
                 self._ticks[token] = {
                     **tick,
                     "_received_at": received_at,
+                    "_received_at_iso": received_at_iso,
                 }
 
     def active_snapshot(
@@ -2251,6 +2442,7 @@ class KiteBroker:
                     day_range_pct=day_range_pct,
                     gap_pct=gap_pct,
                     circuit_buffer_pct=999.0,
+                    observed_at=str(tick.get("_received_at_iso") or ""),
                 )
             )
 
@@ -2272,6 +2464,7 @@ class KiteBroker:
         # full-quote request limit,
         # so this is one REST /quote request per market scan.
         response = self._rate_limited_quote(keys)
+        response_received_at = pd.Timestamp(now_ist())
 
         enriched: list[Quote] = []
 
@@ -2288,6 +2481,22 @@ class KiteBroker:
             q = by_symbol.get(symbol)
 
             if not q:
+                continue
+
+            try:
+                quote_observed_at = market_timestamp(
+                    data.get("timestamp"),
+                    field="quote.timestamp",
+                )
+            except ValueError:
+                continue
+            quote_age = (
+                response_received_at - quote_observed_at
+            ).total_seconds()
+            if (
+                quote_age < -5
+                or quote_age > MAX_EXECUTION_QUOTE_AGE_SECONDS
+            ):
                 continue
 
             depth = data.get("depth") or {}
@@ -2366,6 +2575,7 @@ class KiteBroker:
             q.circuit_buffer_pct = circuit_buffer
             q.lower_circuit_limit = lower
             q.upper_circuit_limit = upper
+            q.observed_at = quote_observed_at.isoformat()
 
             enriched.append(q)
 
@@ -2386,6 +2596,10 @@ class KiteBroker:
         """Refresh price, depth and both directional circuit limits."""
         key = f"NSE:{symbol}"
         data = self._rate_limited_quote([key]).get(key) or {}
+        observed_at = market_timestamp(
+            data.get("timestamp"),
+            field="execution_quote.timestamp",
+        )
         ltp = safe_float(data.get("last_price"))
         depth = data.get("depth") or {}
         buys = depth.get("buy") or []
@@ -2406,7 +2620,7 @@ class KiteBroker:
             spread_bps=spread_bps,
             lower_circuit=lower,
             upper_circuit=upper,
-            observed_at=now_ist().isoformat(),
+            observed_at=observed_at.isoformat(),
         )
 
     def historical_candles(
@@ -2446,17 +2660,27 @@ class KiteBroker:
     def strategy_candles(
         self,
         token: int,
+        *,
+        as_of: Any | None = None,
     ) -> pd.DataFrame:
-        now = now_ist()
-        start = now - timedelta(days=INDICATOR_LOOKBACK_DAYS)
+        # One immutable cutoff governs the request, closed-bar filter, and
+        # continuity validation. Sampling the clock again after REST I/O could
+        # otherwise admit a bar that was incomplete when the request began.
+        cutoff = market_timestamp(
+            as_of if as_of is not None else now_ist(),
+            field="strategy_candles.as_of",
+        )
+        start = cutoff - timedelta(days=INDICATOR_LOOKBACK_DAYS)
 
         df = self.historical_candles(
             token,
             start,
-            now,
+            cutoff,
         )
-
-        return keep_only_closed_5m_candles(df)
+        closed = keep_only_closed_5m_candles(df, as_of=cutoff)
+        validated = validated_strategy_candles(closed, as_of=cutoff)
+        validated.attrs["causal_as_of"] = cutoff.isoformat()
+        return validated
 
     def ltp(
         self,
@@ -3029,6 +3253,7 @@ def select_stocks_in_play(
                 day_range_pct=record["day_range_pct"],
                 gap_pct=record["gap_pct"],
                 circuit_buffer_pct=999.0,
+                observed_at=record["observed_at"],
             )
         )
 
@@ -3101,6 +3326,7 @@ def select_stocks_in_play(
                 lower_circuit_limit=record["lower_circuit_limit"],
                 upper_circuit_limit=record["upper_circuit_limit"],
                 stock_in_play_score=record["stock_in_play_score"],
+                observed_at=record["observed_at"],
             )
         )
 
@@ -3122,24 +3348,32 @@ def select_stocks_in_play(
 
 def get_nifty_regime(
     broker: KiteBroker,
+    *,
+    as_of: Any | None = None,
 ) -> tuple[str, float]:
     df = broker.strategy_candles(
-        broker.nifty_token
+        broker.nifty_token,
+        as_of=as_of,
     )
     time.sleep(CANDLE_DELAY_SECONDS)
 
+    causal_as_of = df.attrs.get("causal_as_of")
+    if not causal_as_of:
+        causal_as_of = market_timestamp(
+            as_of if as_of is not None else now_ist(),
+            field="nifty.as_of",
+        ).isoformat()
+    df = validated_strategy_candles(df, as_of=causal_as_of)
     if df.empty:
-        return "NEUTRAL", 0.0
+        return "UNAVAILABLE", 0.0
 
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
     latest_session = df["date"].dt.date.max()
     if latest_session != now_ist().date():
-        return "NEUTRAL", 0.0
+        return "UNAVAILABLE", 0.0
     today = df[df["date"].dt.date == latest_session]
 
-    if len(today) < 6 or len(df) < 20:
-        return "NEUTRAL", 0.0
+    if len(today) < 4 or len(df) < 20:
+        return "UNAVAILABLE", 0.0
 
     close = df["close"]
 
@@ -3189,12 +3423,28 @@ def detect_setup(
     nifty_regime: str,
     nifty_return_pct: float,
 ) -> Setup | None:
+    if nifty_regime not in {"BULL", "BEAR", "NEUTRAL"}:
+        return None
+    detected_at = pd.Timestamp(now_ist())
+    causal_as_of = df.attrs.get("causal_as_of", detected_at.isoformat())
+    df = validated_strategy_candles(df, as_of=causal_as_of)
     if len(df) < 20:
+        return None
+
+    try:
+        quote_observed_at = market_timestamp(
+            quote.observed_at,
+            field="quote.observed_at",
+        )
+    except ValueError:
+        return None
+    quote_age = (detected_at - quote_observed_at).total_seconds()
+    if quote_age < -5 or quote_age > WS_ACTIVE_TICK_MAX_AGE_SECONDS:
         return None
 
     df = add_indicators(df)
     latest_session = df["date"].dt.date.max()
-    if latest_session != now_ist().date():
+    if latest_session != detected_at.date():
         return None
     today = df[df["date"].dt.date == latest_session].reset_index(drop=True)
 
@@ -3223,9 +3473,15 @@ def detect_setup(
     )
 
     last = today.iloc[-1]
-    prev = today.iloc[-2]
+    signal_bar_closed_at = (
+        pd.Timestamp(last["date"]) + pd.Timedelta(minutes=5)
+    )
+    signal_age = (detected_at - signal_bar_closed_at).total_seconds()
+    if signal_age < 0 or signal_age > MAX_SIGNAL_AGE_SECONDS:
+        return None
 
     price = float(last["close"])
+    candle_open = float(last["open"])
     ema9 = float(last["ema9"])
     ema20 = float(last["ema20"])
     vwap = float(last["vwap"])
@@ -3234,14 +3490,23 @@ def detect_setup(
 
     if (
         price <= 0
+        or quote.prev_close <= 0
         or atr_value <= 0
         or math.isnan(vwap)
     ):
         return None
+    signal_day_change_pct = (
+        (price - quote.prev_close) / quote.prev_close * 100
+    )
 
     rvol_value = (
         float(last["rvol"])
         if pd.notna(last["rvol"])
+        else 0.0
+    )
+    opening_rvol_value = (
+        float(last["opening_rvol"])
+        if pd.notna(last["opening_rvol"])
         else 0.0
     )
 
@@ -3266,20 +3531,23 @@ def detect_setup(
     ):
         return None
 
-    if rvol_value < MIN_RVOL:
+    if (
+        rvol_value < MIN_RVOL
+        or opening_rvol_value < MIN_OPENING_RVOL
+    ):
         return None
 
     if body_ratio < 0.30:
         return None
 
-    long_fresh = (
-        float(prev["close"])
-        <= opening_high + 0.15 * atr_value
+    prior_post_opening_closes = today.iloc[3:-1]["close"]
+    long_fresh = bool(
+        prior_post_opening_closes.empty
+        or (prior_post_opening_closes <= opening_high).all()
     )
-
-    short_fresh = (
-        float(prev["close"])
-        >= opening_low - 0.15 * atr_value
+    short_fresh = bool(
+        prior_post_opening_closes.empty
+        or (prior_post_opening_closes >= opening_low).all()
     )
 
     long_breakout_atr = (
@@ -3302,6 +3570,7 @@ def detect_setup(
 
     long_setup = (
         long_fresh
+        and price > candle_open
         and MIN_BREAKOUT_DISTANCE_ATR
             <= long_breakout_atr
             <= MAX_BREAKOUT_DISTANCE_ATR
@@ -3309,12 +3578,13 @@ def detect_setup(
         and ema9 > ema20
         and 50 <= rsi_value <= 76
         and close_location >= 0.58
-        and quote.pct_change >= 0.30
+        and signal_day_change_pct >= LONG_MIN_DAY_CHANGE_PCT
         and nifty_regime != "BEAR"
     )
 
     short_setup = (
         short_fresh
+        and price < candle_open
         and MIN_BREAKOUT_DISTANCE_ATR
             <= short_breakout_atr
             <= MAX_BREAKOUT_DISTANCE_ATR
@@ -3322,7 +3592,7 @@ def detect_setup(
         and ema9 < ema20
         and 24 <= rsi_value <= 50
         and close_location <= 0.45
-        and quote.pct_change <= -0.20
+        and signal_day_change_pct <= SHORT_MAX_DAY_CHANGE_PCT
         and nifty_regime != "BULL"
     )
 
@@ -3414,7 +3684,7 @@ def detect_setup(
 
         price=price,
         prev_close=quote.prev_close,
-        day_change_pct=quote.pct_change,
+        day_change_pct=signal_day_change_pct,
         gap_pct=quote.gap_pct,
         turnover_crore=quote.turnover_crore,
         spread_bps=quote.spread_bps,
@@ -3440,11 +3710,14 @@ def detect_setup(
         nifty_return_pct=nifty_return_pct,
 
         technical_score=score,
-        signal_at=(
-            pd.Timestamp(last["date"]) + pd.Timedelta(minutes=5)
-        ).isoformat(),
+        signal_at=signal_bar_closed_at.isoformat(),
         lower_circuit_limit=quote.lower_circuit_limit,
         upper_circuit_limit=quote.upper_circuit_limit,
+        signal_price=price,
+        signal_bar_closed_at=signal_bar_closed_at.isoformat(),
+        quote_observed_at=quote_observed_at.isoformat(),
+        setup_detected_at=detected_at.isoformat(),
+        opening_rvol=opening_rvol_value,
     )
 
 
@@ -4024,67 +4297,159 @@ def revalidate_live_setup(
     broker: KiteBroker,
     setup: Setup,
 ) -> tuple[Setup | None, str]:
-    """Recheck signal age and price after the potentially slow AI call."""
+    """Recheck a setup against a fresh executable quote after slow work."""
     try:
-        signal_at = datetime.fromisoformat(setup.signal_at)
-    except (TypeError, ValueError):
+        signal_at = market_timestamp(
+            setup.signal_bar_closed_at or setup.signal_at,
+            field="setup.signal_at",
+        )
+    except ValueError:
         return None, "INVALID_SIGNAL_TIMESTAMP"
 
-    if signal_at.tzinfo is None:
-        signal_at = pd.Timestamp(signal_at, tz=IST).to_pydatetime()
-
-    age_seconds = (now_ist() - signal_at).total_seconds()
-    if age_seconds < -5 or age_seconds > MAX_SIGNAL_AGE_SECONDS:
-        return None, f"STALE_SIGNAL_{age_seconds:.0f}s"
+    if setup.side not in {"LONG", "SHORT"}:
+        return None, "INVALID_TRADE_SIDE"
+    signal_price = safe_float(setup.signal_price)
+    if signal_price <= 0:
+        # Backward-compatible recovery for setup records created before the
+        # immutable signal-price field was introduced.
+        signal_price = safe_float(setup.price)
+    try:
+        atr_value = float(setup.atr)
+        vwap_value = float(setup.vwap)
+        opening_high = float(setup.opening_range_high)
+        opening_low = float(setup.opening_range_low)
+        prev_close = float(setup.prev_close)
+    except (TypeError, ValueError):
+        return None, "INVALID_SIGNAL_BASELINE"
+    setup_values = (
+        atr_value,
+        vwap_value,
+        opening_high,
+        opening_low,
+        prev_close,
+    )
+    if (
+        signal_price <= 0
+        or any(not math.isfinite(value) or value <= 0 for value in setup_values)
+        or opening_high <= opening_low
+    ):
+        return None, "INVALID_SIGNAL_BASELINE"
 
     live_spread = setup.spread_bps
     lower_circuit = setup.lower_circuit_limit
     upper_circuit = setup.upper_circuit_limit
+    quote_observed_at: pd.Timestamp | None = None
+    circuit_buffer = -1.0
     try:
         execution_snapshot = getattr(broker, "execution_snapshot", None)
         if execution_snapshot is None:
             live_price = broker.ltp(setup.symbol)
+            quote_observed_at = market_timestamp(
+                now_ist(),
+                field="execution_quote.received_at",
+            )
         else:
             observed = execution_snapshot(setup.symbol)
             if isinstance(observed, ExecutionSnapshot):
-                live_price = observed.ltp
+                live_price = (
+                    observed.best_ask
+                    if setup.side == "LONG"
+                    else observed.best_bid
+                )
                 live_spread = observed.spread_bps
                 lower_circuit = observed.lower_circuit
                 upper_circuit = observed.upper_circuit
-                circuit_buffer = min(
-                    (upper_circuit - live_price) / live_price * 100,
-                    (live_price - lower_circuit) / live_price * 100,
+                quote_observed_at = market_timestamp(
+                    observed.observed_at,
+                    field="execution_quote.observed_at",
                 )
             else:
                 # Backward-compatible test/broker adapter shape. New real
                 # adapters must return ExecutionSnapshot so directional bands
                 # are preserved.
                 live_price, live_spread, circuit_buffer = observed
-            if live_spread > MAX_SPREAD_BPS:
-                return None, f"LIVE_SPREAD_{live_spread:.1f}BPS"
-            if circuit_buffer < MIN_CIRCUIT_BUFFER_PCT:
-                return None, f"LIVE_CIRCUIT_BUFFER_{circuit_buffer:.2f}PCT"
+                quote_observed_at = market_timestamp(
+                    now_ist(),
+                    field="execution_quote.received_at",
+                )
     except Exception as exc:
         return None, f"EXECUTION_QUOTE_FAILED_{type(exc).__name__}"
 
-    if live_price <= 0 or setup.atr <= 0:
-        return None, "INVALID_LIVE_PRICE"
+    # Freshness is intentionally checked after quote I/O; a request that stalls
+    # cannot revive a signal that expired while waiting for the broker.
+    checked_at = market_timestamp(now_ist(), field="revalidation.checked_at")
+    age_seconds = (checked_at - signal_at).total_seconds()
+    if age_seconds < -5 or age_seconds > MAX_SIGNAL_AGE_SECONDS:
+        return None, f"STALE_SIGNAL_{age_seconds:.0f}s"
+    if quote_observed_at is None:
+        return None, "INVALID_EXECUTION_QUOTE_TIMESTAMP"
+    quote_age = (checked_at - quote_observed_at).total_seconds()
+    if quote_age < -5 or quote_age > MAX_EXECUTION_QUOTE_AGE_SECONDS:
+        return None, f"STALE_EXECUTION_QUOTE_{quote_age:.0f}s"
 
-    drift_atr = abs(live_price - setup.price) / setup.atr
+    try:
+        live_price = float(live_price)
+        live_spread = float(live_spread)
+        lower_circuit = float(lower_circuit)
+        upper_circuit = float(upper_circuit)
+    except (TypeError, ValueError):
+        return None, "INVALID_LIVE_PRICE"
+    if (
+        not math.isfinite(live_price)
+        or live_price <= 0
+        or not math.isfinite(live_spread)
+        or live_spread < 0
+    ):
+        return None, "INVALID_LIVE_PRICE"
+    if live_spread > MAX_SPREAD_BPS:
+        return None, f"LIVE_SPREAD_{live_spread:.1f}BPS"
+    if not (
+        math.isfinite(lower_circuit)
+        and math.isfinite(upper_circuit)
+        and upper_circuit > live_price > lower_circuit > 0
+    ):
+        return None, "INVALID_LIVE_CIRCUIT_LIMITS"
+    circuit_buffer = min(
+        (upper_circuit - live_price) / live_price * 100,
+        (live_price - lower_circuit) / live_price * 100,
+    )
+    if (
+        not math.isfinite(circuit_buffer)
+        or circuit_buffer < MIN_CIRCUIT_BUFFER_PCT
+    ):
+        return None, f"LIVE_CIRCUIT_BUFFER_{circuit_buffer:.2f}PCT"
+
+    drift_atr = abs(live_price - signal_price) / atr_value
     if drift_atr > MAX_ENTRY_DRIFT_ATR:
         return None, f"PRICE_DRIFT_{drift_atr:.2f}ATR"
 
+    vwap_distance_atr = abs(live_price - vwap_value) / atr_value
+    if vwap_distance_atr > MAX_VWAP_DISTANCE_ATR:
+        return None, f"LIVE_VWAP_DISTANCE_{vwap_distance_atr:.2f}ATR"
+
+    day_change_pct = (live_price - prev_close) / prev_close * 100
+    if (
+        setup.side == "LONG"
+        and day_change_pct < LONG_MIN_DAY_CHANGE_PCT
+    ):
+        return None, f"LONG_DAY_CHANGE_{day_change_pct:.2f}PCT"
+    if (
+        setup.side == "SHORT"
+        and day_change_pct > SHORT_MAX_DAY_CHANGE_PCT
+    ):
+        return None, f"SHORT_DAY_CHANGE_{day_change_pct:.2f}PCT"
+
     if setup.side == "LONG":
         breakout_atr = (
-            live_price - setup.opening_range_high
-        ) / setup.atr
-        if live_price <= max(setup.opening_range_high, setup.vwap):
+            live_price - opening_high
+        ) / atr_value
+        if live_price <= max(opening_high, vwap_value):
             return None, "LONG_BREAKOUT_FAILED"
     else:
         breakout_atr = (
-            setup.opening_range_low - live_price
-        ) / setup.atr
-        if live_price >= min(setup.opening_range_low, setup.vwap):
+            opening_low - live_price
+        ) / atr_value
+        if live_price >= min(opening_low, vwap_value):
             return None, "SHORT_BREAKOUT_FAILED"
 
     if not (
@@ -4097,12 +4462,54 @@ def revalidate_live_setup(
     return replace(
         setup,
         price=live_price,
+        signal_price=signal_price,
+        day_change_pct=day_change_pct,
         spread_bps=live_spread,
         breakout_distance_atr=breakout_atr,
-        vwap_distance_atr=abs(live_price - setup.vwap) / setup.atr,
+        vwap_distance_atr=vwap_distance_atr,
         lower_circuit_limit=lower_circuit,
         upper_circuit_limit=upper_circuit,
+        quote_observed_at=quote_observed_at.isoformat(),
+        last_validated_at=checked_at.isoformat(),
     ), "OK"
+
+
+def submission_freshness_reason(
+    setup: Setup,
+    *,
+    observed_at: Any | None = None,
+) -> str | None:
+    """Return a fail-closed reason when a validated setup is no longer fresh."""
+    checked_at = market_timestamp(
+        observed_at if observed_at is not None else now_ist(),
+        field="submission.observed_at",
+    )
+    try:
+        signal_at = market_timestamp(
+            setup.signal_bar_closed_at or setup.signal_at,
+            field="setup.signal_at",
+        )
+        quote_at = market_timestamp(
+            setup.quote_observed_at,
+            field="setup.quote_observed_at",
+        )
+        validated_at = market_timestamp(
+            setup.last_validated_at,
+            field="setup.last_validated_at",
+        )
+    except ValueError:
+        return "MISSING_SUBMISSION_PROVENANCE"
+
+    signal_age = (checked_at - signal_at).total_seconds()
+    if signal_age < -5 or signal_age > MAX_SIGNAL_AGE_SECONDS:
+        return f"STALE_SIGNAL_{signal_age:.0f}s"
+    quote_age = (checked_at - quote_at).total_seconds()
+    if quote_age < -5 or quote_age > MAX_EXECUTION_QUOTE_AGE_SECONDS:
+        return f"STALE_EXECUTION_QUOTE_{quote_age:.0f}s"
+    validation_age = (checked_at - validated_at).total_seconds()
+    if validation_age < -5 or validation_age > MAX_EXECUTION_QUOTE_AGE_SECONDS:
+        return f"STALE_EXECUTION_VALIDATION_{validation_age:.0f}s"
+    return None
 
 
 def build_trade_result(
@@ -4285,6 +4692,89 @@ def build_trade(
         risk_budget=risk_budget,
         notional_budget=notional_budget,
     ).trade
+
+
+def rebuild_trade_for_submission(
+    broker: KiteBroker,
+    original: Trade,
+    setup: Setup,
+    capacity: EntryCapacity,
+) -> TradeBuildResult:
+    """Reprice a pre-entry plan without increasing its reviewed quantity."""
+    rebuilt = build_trade_result(
+        broker,
+        setup,
+        risk_budget=capacity.candidate_risk_budget,
+        notional_budget=capacity.candidate_notional_budget,
+    )
+    if rebuilt.trade is None:
+        return rebuilt
+
+    trade = rebuilt.trade
+    reviewed_qty = original.requested_qty or original.qty
+    if reviewed_qty <= 0:
+        return TradeBuildResult(None, "INVALID_REVIEWED_QUANTITY")
+    if trade.qty > reviewed_qty:
+        inst = broker.instrument(trade.symbol)
+        if inst is None:
+            return TradeBuildResult(None, "INSTRUMENT_UNAVAILABLE")
+        trade.qty = reviewed_qty
+        trade.requested_qty = reviewed_qty
+        trade.planned_risk_amount = planned_after_cost_stop_loss(
+            trade.side,
+            trade.entry_price,
+            trade.stop_price,
+            reviewed_qty,
+        )
+        trade.reserved_risk_amount = trade.planned_risk_amount
+        trade.reserved_notional_amount = (
+            setup.price * (1 + RISK_SLIPPAGE_BPS / 10_000) * reviewed_qty
+        )
+        outcome = estimate_after_cost_outcome(
+            trade.side,
+            trade.entry_price,
+            trade.initial_risk_per_share,
+            trade.initial_risk_per_share * TARGET_R_MULTIPLE,
+            reviewed_qty,
+            inst.tick_size,
+        )
+        if outcome.target_profit <= 0:
+            return TradeBuildResult(
+                None,
+                "NONPOSITIVE_AFTER_COST_TARGET",
+                outcome,
+            )
+        if outcome.payoff_ratio < MIN_AFTER_COST_PAYOFF_RATIO:
+            return TradeBuildResult(
+                None,
+                (
+                    f"AFTER_COST_PAYOFF_{outcome.payoff_ratio:.3f}_LT_"
+                    f"{MIN_AFTER_COST_PAYOFF_RATIO:.3f}"
+                ),
+                outcome,
+            )
+        trade.planned_target_profit_amount = outcome.target_profit
+        trade.planned_after_cost_payoff = outcome.payoff_ratio
+        rebuilt = TradeBuildResult(trade, "OK", outcome)
+
+    for name in (
+        "client_tag",
+        "idea_id",
+        "ai_review_idea_id",
+        "ai_mode",
+        "ai_valid",
+        "ai_error",
+        "ai_response_model",
+        "ai_response_id",
+        "ai_prompt_version",
+        "ai_decision_id",
+        "ai_input_sha256",
+        "ai_input_tokens",
+        "ai_output_tokens",
+        "ai_total_tokens",
+    ):
+        setattr(trade, name, getattr(original, name))
+    return rebuilt
 
 
 # =============================================================================
@@ -6662,6 +7152,53 @@ def execute_trade(
         )
         return
 
+    # This is the authoritative, post-preflight market check. It protects
+    # direct callers too, and uses the immutable candle-close price so repeated
+    # validations cannot gradually walk the permitted drift window.
+    submission_setup, submission_reason = revalidate_live_setup(broker, setup)
+    if submission_setup is None:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=f"PRE_SUBMIT_{submission_reason}",
+        )
+        return
+    setup = submission_setup
+    submission_capacity = entry_capacity(state)
+    if not submission_capacity.allowed:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=submission_capacity.reason,
+        )
+        return
+    repriced = rebuild_trade_for_submission(
+        broker,
+        trade,
+        setup,
+        submission_capacity,
+    )
+    if repriced.trade is None:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=f"PRE_SUBMIT_{repriced.reason}",
+        )
+        return
+    trade = repriced.trade
+    admitted, admission_reason = assess_trade_admission(state, trade)
+    if not admitted:
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol=trade.symbol,
+            side=trade.side,
+            reason=f"PRE_SUBMIT_{admission_reason}",
+        )
+        return
+
     trade.ai_decision = ai_decision.decision if AI_MODE != "off" else "OFF"
     trade.entry_tag = new_order_tag("ENT")
     trade.stop_tag = new_order_tag("STP")
@@ -6685,9 +7222,12 @@ def execute_trade(
         )
         return
 
-    # Durable telemetry above can cross the guarded cutoff. No broker mutation
-    # is allowed after that boundary, even though an entry intent exists.
-    if not entry_window_open():
+    # Durable telemetry above can cross either the guarded cutoff or the quote
+    # freshness budget. No broker mutation is allowed after either boundary,
+    # even though an entry intent exists.
+    window_still_open = entry_window_open()
+    stale_reason = submission_freshness_reason(setup)
+    if not window_still_open or stale_reason is not None:
         trade.status = "ABORTED"
         trade.reserved_risk_amount = 0.0
         try:
@@ -6702,7 +7242,11 @@ def execute_trade(
             "SIGNAL_REJECTED",
             symbol=trade.symbol,
             side=trade.side,
-            reason="ENTRY_CUTOFF_AFTER_INTENT",
+            reason=(
+                "ENTRY_CUTOFF_AFTER_INTENT"
+                if not window_still_open
+                else f"PRE_MUTATION_{stale_reason}"
+            ),
         )
         return
 
@@ -7593,9 +8137,24 @@ def scan_for_new_trades(
         )
         return
 
+    # Every historical request in this scan shares one information cutoff.
+    # This prevents a boundary crossing from mixing a new stock bar with an
+    # older NIFTY regime or with other candidates from a different bar cohort.
+    scan_as_of = market_timestamp(now_ist(), field="scan.as_of")
     nifty_regime, nifty_return_pct = (
-        get_nifty_regime(broker)
+        get_nifty_regime(broker, as_of=scan_as_of)
     )
+
+    if nifty_regime == "UNAVAILABLE":
+        journal_best_effort(
+            "SIGNAL_REJECTED",
+            symbol="NIFTY",
+            side="MARKET",
+            reason="NIFTY_DATA_UNAVAILABLE",
+            causal_as_of=scan_as_of.isoformat(),
+        )
+        log("NIFTY data unavailable or incomplete; skipping all new entries.")
+        return
 
     log(
         f"NIFTY regime: {nifty_regime} "
@@ -7623,7 +8182,8 @@ def scan_for_new_trades(
             if open_trade_count(state) > 0:
                 monitor_open_trades(broker, state)
             df = broker.strategy_candles(
-                quote.token
+                quote.token,
+                as_of=scan_as_of,
             )
 
             time.sleep(
@@ -7694,6 +8254,7 @@ def scan_for_new_trades(
             f"Tech={setup.technical_score:.1f}, "
             f"SIP={setup.stock_in_play_score:.1f}, "
             f"RVOL={setup.rvol:.2f}, "
+            f"ORVOL={setup.opening_rvol:.2f}, "
             f"Turnover=₹{setup.turnover_crore:.1f}cr, "
             f"Spread={setup.spread_bps:.1f}bps"
         )

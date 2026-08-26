@@ -84,6 +84,12 @@ def make_setup(side: str = "LONG"):
         signal_at=FIXED_NOW.isoformat(),
         lower_circuit_limit=90.0,
         upper_circuit_limit=110.0,
+        signal_price=100.0,
+        signal_bar_closed_at=FIXED_NOW.isoformat(),
+        quote_observed_at=FIXED_NOW.isoformat(),
+        setup_detected_at=FIXED_NOW.isoformat(),
+        last_validated_at=FIXED_NOW.isoformat(),
+        opening_rvol=2.0,
     )
 
 
@@ -382,6 +388,29 @@ class IsolatedBotTestCase(unittest.TestCase):
 
 
 class StrategyHelperSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _current_candle_frame(
+        *,
+        end: str = "09:50",
+    ) -> pd.DataFrame:
+        session_date = FIXED_NOW.date().isoformat()
+        dates = pd.date_range(
+            f"{session_date} 09:15",
+            f"{session_date} {end}",
+            freq="5min",
+            tz="Asia/Kolkata",
+        )
+        return pd.DataFrame(
+            {
+                "date": dates,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1_000.0,
+            }
+        )
+
     def test_rsi_handles_gain_loss_and_flat_edge_cases(self) -> None:
         gains = bot.rsi(pd.Series(range(1, 22), dtype=float))
         losses = bot.rsi(pd.Series(range(22, 1, -1), dtype=float))
@@ -390,6 +419,377 @@ class StrategyHelperSafetyTests(unittest.TestCase):
         self.assertTrue((gains.iloc[1:] == 100.0).all())
         self.assertTrue((losses.iloc[1:] == 0.0).all())
         self.assertTrue((flat == 50.0).all())
+
+    def test_strategy_candles_uses_one_causal_cutoff_across_boundary(self) -> None:
+        raw = self._current_candle_frame(end="09:55")
+        broker = bot.KiteBroker.__new__(bot.KiteBroker)
+        broker.historical_candles = mock.Mock(return_value=raw)
+        cutoff = FIXED_NOW.replace(second=1)
+
+        with (
+            mock.patch.object(bot, "CANDLE_CLOSE_GRACE_SECONDS", 2.0),
+            mock.patch.object(bot, "now_ist", return_value=cutoff) as clock,
+        ):
+            candles = broker.strategy_candles(123)
+
+        self.assertEqual(clock.call_count, 1)
+        self.assertEqual(candles["date"].iloc[-1].strftime("%H:%M"), "09:50")
+        self.assertEqual(candles.attrs["causal_as_of"], pd.Timestamp(cutoff).isoformat())
+
+    def test_strategy_candle_validation_rejects_gaps_duplicates_and_partial_bars(self) -> None:
+        frame = self._current_candle_frame()
+        with mock.patch.object(bot, "CANDLE_CLOSE_GRACE_SECONDS", 2.0):
+            accepted = bot.validated_strategy_candles(frame, as_of=FIXED_NOW)
+            self.assertEqual(len(accepted), len(frame))
+
+            missing = frame.drop(index=4).reset_index(drop=True)
+            duplicate = pd.concat([frame, frame.iloc[[4]]], ignore_index=True)
+            misaligned = frame.copy()
+            misaligned.loc[4, "date"] += pd.Timedelta(seconds=1)
+            invalid_ohlc = frame.copy()
+            invalid_ohlc.loc[4, "high"] = 100.1
+            partial = pd.concat(
+                [frame, self._current_candle_frame(end="09:55").tail(1)],
+                ignore_index=True,
+            )
+
+            for name, candidate in {
+                "missing": missing,
+                "duplicate": duplicate,
+                "misaligned": misaligned,
+                "invalid_ohlc": invalid_ohlc,
+                "partial": partial,
+            }.items():
+                with self.subTest(name=name):
+                    self.assertTrue(
+                        bot.validated_strategy_candles(
+                            candidate,
+                            as_of=FIXED_NOW,
+                        ).empty
+                    )
+
+    def test_opening_rvol_uses_only_prior_complete_opening_windows(self) -> None:
+        rows = []
+        sessions = pd.date_range("2026-08-03", "2026-08-11", freq="B")
+        for session_index, session in enumerate(sessions):
+            volume = 2_000.0 if session_index == len(sessions) - 1 else 1_000.0
+            for minute in (15, 20, 25):
+                rows.append(
+                    {
+                        "date": pd.Timestamp(
+                            year=session.year,
+                            month=session.month,
+                            day=session.day,
+                            hour=9,
+                            minute=minute,
+                            tz="Asia/Kolkata",
+                        ),
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 100.5,
+                        "volume": volume,
+                    }
+                )
+
+        enriched = bot.add_indicators(pd.DataFrame(rows))
+        current = enriched[enriched["date"].dt.date == FIXED_NOW.date()]
+
+        self.assertTrue((current["opening_rvol"] == 2.0).all())
+
+    def test_detect_setup_requires_first_directional_close_and_records_provenance(self) -> None:
+        detected_at = FIXED_NOW + pd.Timedelta(seconds=3)
+        prior_base = self._current_candle_frame()
+        prior = pd.concat(
+            [prior_base, prior_base.iloc[:3]],
+            ignore_index=True,
+        )
+        prior["date"] = pd.date_range(
+            "2026-08-10 09:15",
+            periods=len(prior),
+            freq="5min",
+            tz="Asia/Kolkata",
+        )
+        current = self._current_candle_frame(end="09:55")
+        frame = pd.concat([prior, current], ignore_index=True)
+        frame["ema9"] = 99.5
+        frame["ema20"] = 99.0
+        frame["rsi"] = 60.0
+        frame["atr"] = 2.0
+        frame["vwap"] = 99.0
+        frame["rvol"] = 2.0
+        frame["opening_rvol"] = 2.0
+        frame["body_ratio"] = 0.8
+        frame["close_location"] = 0.9
+        current_start = len(prior)
+        frame.loc[current_start:current_start + 2, "high"] = 99.0
+        frame.loc[current_start + 3:len(frame) - 2, "close"] = 99.0
+        frame.loc[len(frame) - 1, ["open", "high", "low", "close"]] = [
+            99.5,
+            100.2,
+            99.4,
+            100.0,
+        ]
+        quote = bot.Quote(
+            symbol="INFY",
+            token=123,
+            ltp=100.0,
+            open=98.0,
+            high=100.2,
+            low=98.0,
+            prev_close=98.0,
+            pct_change=2.0,
+            trade_volume=1_000_000,
+            turnover_crore=100.0,
+            spread_bps=2.0,
+            day_range_pct=2.0,
+            gap_pct=0.0,
+            circuit_buffer_pct=5.0,
+            lower_circuit_limit=90.0,
+            upper_circuit_limit=110.0,
+            stock_in_play_score=90.0,
+            observed_at=pd.Timestamp(detected_at).isoformat(),
+        )
+
+        def detect(candidate: pd.DataFrame):
+            with (
+                mock.patch.object(bot, "now_ist", return_value=detected_at),
+                mock.patch.object(
+                    bot,
+                    "validated_strategy_candles",
+                    side_effect=lambda data, **_: data,
+                ),
+                mock.patch.object(bot, "add_indicators", side_effect=lambda data: data),
+            ):
+                return bot.detect_setup(quote, candidate, "BULL", 0.3)
+
+        setup = detect(frame.copy())
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup.signal_price, 100.0)
+        self.assertEqual(setup.signal_bar_closed_at, FIXED_NOW.isoformat())
+        self.assertEqual(setup.quote_observed_at, pd.Timestamp(detected_at).isoformat())
+        self.assertEqual(setup.setup_detected_at, pd.Timestamp(detected_at).isoformat())
+        self.assertEqual(setup.opening_rvol, 2.0)
+
+        already_broken = frame.copy()
+        already_broken.loc[len(already_broken) - 2, "close"] = 99.1
+        self.assertIsNone(detect(already_broken))
+
+        failed_breakout_then_reentry = frame.copy()
+        failed_breakout_then_reentry.loc[
+            len(failed_breakout_then_reentry) - 3,
+            "close",
+        ] = 99.1
+        self.assertIsNone(detect(failed_breakout_then_reentry))
+
+        counter_direction = frame.copy()
+        counter_direction.loc[len(counter_direction) - 1, "open"] = 100.1
+        self.assertIsNone(detect(counter_direction))
+
+    def test_revalidation_uses_executable_ask_and_immutable_signal_price(self) -> None:
+        snapshots = [
+            bot.ExecutionSnapshot(
+                ltp=100.45,
+                best_bid=100.40,
+                best_ask=100.50,
+                spread_bps=2.0,
+                lower_circuit=90.0,
+                upper_circuit=110.0,
+                observed_at=FIXED_NOW.isoformat(),
+            ),
+            bot.ExecutionSnapshot(
+                ltp=100.65,
+                best_bid=100.60,
+                best_ask=100.70,
+                spread_bps=2.0,
+                lower_circuit=90.0,
+                upper_circuit=110.0,
+                observed_at=FIXED_NOW.isoformat(),
+            ),
+        ]
+        broker = mock.Mock()
+        broker.execution_snapshot.side_effect = snapshots
+
+        with mock.patch.object(bot, "now_ist", return_value=FIXED_NOW):
+            first, first_reason = bot.revalidate_live_setup(broker, make_setup())
+            second, second_reason = bot.revalidate_live_setup(broker, first)
+
+        self.assertEqual(first_reason, "OK")
+        self.assertEqual(first.price, 100.50)
+        self.assertEqual(first.signal_price, 100.0)
+        self.assertIsNone(second)
+        self.assertEqual(second_reason, "PRICE_DRIFT_0.35ATR")
+
+    def test_revalidation_checks_signal_and_exchange_quote_freshness_after_io(self) -> None:
+        mutable_clock = [FIXED_NOW]
+
+        class DelayedBroker:
+            def execution_snapshot(self, symbol):
+                mutable_clock[0] = FIXED_NOW + pd.Timedelta(
+                    seconds=bot.MAX_SIGNAL_AGE_SECONDS + 1
+                )
+                return bot.ExecutionSnapshot(
+                    ltp=100.0,
+                    best_bid=99.95,
+                    best_ask=100.05,
+                    spread_bps=2.0,
+                    lower_circuit=90.0,
+                    upper_circuit=110.0,
+                    observed_at=pd.Timestamp(mutable_clock[0]).isoformat(),
+                )
+
+        with mock.patch.object(bot, "now_ist", side_effect=lambda: mutable_clock[0]):
+            delayed, delayed_reason = bot.revalidate_live_setup(
+                DelayedBroker(),
+                make_setup(),
+            )
+
+        self.assertIsNone(delayed)
+        self.assertTrue(delayed_reason.startswith("STALE_SIGNAL_"))
+
+        stale_snapshot = bot.ExecutionSnapshot(
+            ltp=100.0,
+            best_bid=99.95,
+            best_ask=100.05,
+            spread_bps=2.0,
+            lower_circuit=90.0,
+            upper_circuit=110.0,
+            observed_at=(
+                FIXED_NOW
+                - pd.Timedelta(seconds=bot.MAX_EXECUTION_QUOTE_AGE_SECONDS + 1)
+            ).isoformat(),
+        )
+        broker = mock.Mock()
+        broker.execution_snapshot.return_value = stale_snapshot
+        with mock.patch.object(bot, "now_ist", return_value=FIXED_NOW):
+            stale, stale_reason = bot.revalidate_live_setup(broker, make_setup())
+
+        self.assertIsNone(stale)
+        self.assertTrue(stale_reason.startswith("STALE_EXECUTION_QUOTE_"))
+
+    def test_revalidation_reapplies_vwap_extension_limit(self) -> None:
+        setup = replace(make_setup(), vwap=96.6, vwap_distance_atr=1.7)
+        broker = mock.Mock()
+        broker.execution_snapshot.return_value = bot.ExecutionSnapshot(
+            ltp=100.35,
+            best_bid=100.30,
+            best_ask=100.40,
+            spread_bps=2.0,
+            lower_circuit=90.0,
+            upper_circuit=110.0,
+            observed_at=FIXED_NOW.isoformat(),
+        )
+
+        with (
+            mock.patch.object(bot, "MAX_VWAP_DISTANCE_ATR", 1.8),
+            mock.patch.object(bot, "now_ist", return_value=FIXED_NOW),
+        ):
+            refreshed, reason = bot.revalidate_live_setup(broker, setup)
+
+        self.assertIsNone(refreshed)
+        self.assertEqual(reason, "LIVE_VWAP_DISTANCE_1.90ATR")
+
+    def test_revalidation_reapplies_directional_day_change(self) -> None:
+        cases = [
+            (
+                replace(
+                    make_setup("LONG"),
+                    signal_price=100.4,
+                    price=100.4,
+                    prev_close=100.0,
+                    opening_range_high=99.8,
+                    opening_range_low=99.0,
+                    vwap=99.5,
+                ),
+                bot.ExecutionSnapshot(
+                    ltp=100.15,
+                    best_bid=100.10,
+                    best_ask=100.20,
+                    spread_bps=2.0,
+                    lower_circuit=90.0,
+                    upper_circuit=110.0,
+                    observed_at=FIXED_NOW.isoformat(),
+                ),
+                "LONG_DAY_CHANGE_0.20PCT",
+            ),
+            (
+                replace(
+                    make_setup("SHORT"),
+                    signal_price=99.6,
+                    price=99.6,
+                    prev_close=100.0,
+                    opening_range_high=101.0,
+                    opening_range_low=100.0,
+                    vwap=100.2,
+                ),
+                bot.ExecutionSnapshot(
+                    ltp=99.95,
+                    best_bid=99.90,
+                    best_ask=100.00,
+                    spread_bps=2.0,
+                    lower_circuit=90.0,
+                    upper_circuit=110.0,
+                    observed_at=FIXED_NOW.isoformat(),
+                ),
+                "SHORT_DAY_CHANGE_-0.10PCT",
+            ),
+        ]
+
+        for setup, snapshot, expected in cases:
+            with self.subTest(side=setup.side):
+                broker = mock.Mock()
+                broker.execution_snapshot.return_value = snapshot
+                with mock.patch.object(bot, "now_ist", return_value=FIXED_NOW):
+                    refreshed, reason = bot.revalidate_live_setup(broker, setup)
+                self.assertIsNone(refreshed)
+                self.assertEqual(reason, expected)
+
+    def test_submission_rebuild_reprices_without_increasing_reviewed_quantity(self) -> None:
+        broker = FakeBroker(price=100.5)
+        original = make_trade()
+        original.idea_id = "reviewed-idea"
+        setup = replace(make_setup(), price=100.5)
+        capacity = bot.entry_capacity(bot.fresh_state())
+
+        result = bot.rebuild_trade_for_submission(
+            broker,
+            original,
+            setup,
+            capacity,
+        )
+
+        self.assertEqual(result.reason, "OK")
+        self.assertIsNotNone(result.trade)
+        self.assertEqual(result.trade.entry_price, 100.5)
+        self.assertLessEqual(result.trade.qty, original.requested_qty)
+        self.assertEqual(result.trade.idea_id, "reviewed-idea")
+        self.assertLessEqual(
+            result.trade.reserved_risk_amount,
+            capacity.candidate_risk_budget,
+        )
+
+    def test_execution_snapshot_preserves_exchange_timestamp(self) -> None:
+        exchange_time = datetime(2026, 8, 11, 9, 59, 58)
+        broker = bot.KiteBroker.__new__(bot.KiteBroker)
+        broker._rate_limited_quote = mock.Mock(
+            return_value={
+                "NSE:INFY": {
+                    "timestamp": exchange_time,
+                    "last_price": 100.0,
+                    "depth": {
+                        "buy": [{"price": 99.95}],
+                        "sell": [{"price": 100.05}],
+                    },
+                    "lower_circuit_limit": 90.0,
+                    "upper_circuit_limit": 110.0,
+                }
+            }
+        )
+
+        snapshot = broker.execution_snapshot("INFY")
+
+        expected = pd.Timestamp(exchange_time, tz="Asia/Kolkata").isoformat()
+        self.assertEqual(snapshot.observed_at, expected)
 
     def test_paper_fill_slippage_is_always_adverse(self) -> None:
         with mock.patch.object(bot, "PAPER_SLIPPAGE_BPS", 5.0):
@@ -872,7 +1272,16 @@ class PaperExecutionLifecycleTests(IsolatedBotTestCase):
         trade.reserved_risk_amount = 100.0
         trade.reserved_notional_amount = 25_000.0
 
-        with mock.patch.object(bot, "fail_safe_trade_lifecycle") as fail_safe:
+        # Isolate the post-fill defence from the pre-submit repricer, which
+        # would normally reduce this deliberately oversized synthetic plan.
+        with (
+            mock.patch.object(
+                bot,
+                "rebuild_trade_for_submission",
+                return_value=bot.TradeBuildResult(trade, "OK"),
+            ),
+            mock.patch.object(bot, "fail_safe_trade_lifecycle") as fail_safe,
+        ):
             bot.execute_trade(
                 broker,
                 trade,
@@ -1051,6 +1460,36 @@ class PaperExecutionLifecycleTests(IsolatedBotTestCase):
 
         self.assertEqual(broker.entry_calls, [])
         self.assertNotIn("INFY", state["trades"])
+
+    def test_direct_execution_rejects_stale_setup_before_intent(self) -> None:
+        broker = FakeBroker()
+        state = bot.fresh_state()
+
+        with (
+            mock.patch.object(
+                bot,
+                "revalidate_live_setup",
+                return_value=(None, "STALE_SIGNAL_301s"),
+            ),
+            mock.patch.object(bot, "journal_best_effort", return_value=True) as journal,
+        ):
+            bot.execute_trade(
+                broker,
+                make_trade(),
+                make_setup(),
+                approved_decision(),
+                state,
+            )
+
+        self.assertNotIn("INFY", state["trades"])
+        self.assertEqual(broker.entry_calls, [])
+        self.assertEqual(broker.stop_calls, [])
+        self.assertTrue(
+            any(
+                call.kwargs.get("reason") == "PRE_SUBMIT_STALE_SIGNAL_301s"
+                for call in journal.call_args_list
+            )
+        )
 
     def test_cutoff_crossed_while_persisting_intent_aborts_before_entry(self) -> None:
         broker = FakeBroker()
@@ -1604,6 +2043,75 @@ class LiveFaultRecoveryTests(IsolatedBotTestCase):
 
 
 class AIModeScanSemanticsTests(IsolatedBotTestCase):
+    def test_scan_uses_one_candle_cutoff_across_five_minute_boundary(self) -> None:
+        broker = FakeBroker()
+        broker.nifty_token = 999
+        cutoffs = []
+        current = StrategyHelperSafetyTests._current_candle_frame()
+        prior = pd.concat([current, current.iloc[:4]], ignore_index=True)
+        prior["date"] = pd.date_range(
+            "2026-08-10 09:15",
+            periods=len(prior),
+            freq="5min",
+            tz="Asia/Kolkata",
+        )
+        nifty_frame = pd.concat([prior, current], ignore_index=True)
+
+        def candles(token, *, as_of=None):
+            cutoffs.append((token, pd.Timestamp(as_of)))
+            result = nifty_frame.copy() if token == 999 else pd.DataFrame()
+            result.attrs["causal_as_of"] = pd.Timestamp(as_of).isoformat()
+            return result
+
+        broker.strategy_candles = candles
+        candidate = mock.Mock(symbol="INFY", token=123)
+        crossed_boundary = FIXED_NOW + pd.Timedelta(minutes=5)
+        state = bot.fresh_state()
+
+        with (
+            mock.patch.object(bot, "entry_window_open", return_value=True),
+            mock.patch.object(
+                bot,
+                "select_stocks_in_play",
+                return_value=[candidate],
+            ),
+            mock.patch.object(
+                bot,
+                "now_ist",
+                side_effect=[FIXED_NOW, crossed_boundary, crossed_boundary],
+            ),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            bot.scan_for_new_trades(broker, None, state)
+
+        self.assertEqual([token for token, _ in cutoffs], [999, 123])
+        self.assertEqual(cutoffs[0][1], pd.Timestamp(FIXED_NOW))
+        self.assertEqual(cutoffs[1][1], pd.Timestamp(FIXED_NOW))
+
+    def test_unavailable_nifty_data_aborts_candidate_evaluation(self) -> None:
+        broker = FakeBroker()
+        broker.nifty_token = 999
+        broker.strategy_candles = mock.Mock(return_value=pd.DataFrame())
+        candidate = mock.Mock(symbol="INFY", token=123)
+
+        with (
+            mock.patch.object(bot, "entry_window_open", return_value=True),
+            mock.patch.object(
+                bot,
+                "select_stocks_in_play",
+                return_value=[candidate],
+            ),
+            mock.patch.object(bot, "detect_setup") as detect,
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            bot.scan_for_new_trades(broker, None, bot.fresh_state())
+
+        detect.assert_not_called()
+        broker.strategy_candles.assert_called_once_with(
+            999,
+            as_of=mock.ANY,
+        )
+
     def _run_scan(self, mode: str, decision):
         broker = FakeBroker()
         broker.strategy_candles = mock.Mock(return_value=pd.DataFrame())

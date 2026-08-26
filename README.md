@@ -1,4 +1,4 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.5
+# Zerodha Kite + GPT AI Intraday Bot V3.7
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
@@ -33,10 +33,12 @@ AI_MODE=off | synchronous online shadow/gate review
 final live revalidation + trade rebuild + capacity reservation
         ↘ append-only AI_CANDIDATE record → offline ai_ideas.py
         ↓
+post-account-preflight executable quote/freshness gate + final rebuild
+        ↓
 paper execution or guarded MIS order workflow
 ```
 
-V3.5 shards the dynamic NSE EQ universe across up to three WebSocket
+The bot shards the dynamic NSE EQ universe across up to three WebSocket
 connections. The default is 2,800 instruments per socket, below Kite's
 documented 3,000-instrument limit. All sockets update one thread-safe tick
 store; no fixed watchlist is required.
@@ -338,13 +340,24 @@ the relevant evidence. Historical profit never guarantees future profit.
 The deterministic candidate logic uses:
 
 - dynamic stock-in-play selection and liquidity/spread filters
-- a 15-minute opening range
+- a fully closed, contiguous 15-minute opening range
 - VWAP and EMA 9/20 trend confirmation
-- RSI, ATR, and same-clock-time historical relative volume
-- breakout candle quality and NIFTY regime
+- RSI, ATR, same-clock breakout RVOL, and prior-session 15-minute opening RVOL
+- the first directional candle close beyond the range, candle quality, and NIFTY regime
 - an ATR stop and configurable R-multiple target
-- signal-age and entry-drift checks
+- exchange-timestamp quote freshness, immutable signal-price drift, and live
+  spread/VWAP/breakout/circuit revalidation
 - no new entries after 14:30 and forced exit at 15:10
+
+The candle request, incomplete-bar filter, and continuity validator share one
+captured timestamp. A bar is eligible only after its full five-minute interval
+plus `CANDLE_CLOSE_GRACE_SECONDS`; missing, duplicate, misaligned, malformed, or
+unexpected current-session bars make the scan fail closed. Immediately before
+entry intent, LONG uses the best ask and SHORT uses the best bid. Exchange quote
+age must remain within `MAX_EXECUTION_QUOTE_AGE_SECONDS`, and every drift check
+is measured from the immutable signal-candle close rather than the prior refresh.
+These controls remove known look-ahead and stale-entry paths; they do not prove
+that the strategy has positive expectancy.
 
 Default ceilings for `CAPITAL_LIMIT=100000` are approximately ₹200 planned risk
 per stopped trade, ₹25,000 maximum position notional, ₹400 aggregate open-stop

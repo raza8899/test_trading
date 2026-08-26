@@ -1,6 +1,6 @@
 # Research and validation notes
 
-Audit date: 2026-08-11.
+Audit date: 2026-08-26.
 
 > This bot is not demonstrated to be profitable, production-ready, or legally
 > compliant for a particular account. Keep `LIVE_TRADING=false`. Software
@@ -13,15 +13,53 @@ Audit date: 2026-08-11.
 ### Causal market-data path
 
 The broad scan uses current WebSocket ticks, then one full-quote request for
-depth/circuit checks, and historical candles only for the shortlist. The setup
-engine drops the forming five-minute candle, warms EMA/RSI/ATR over earlier
-sessions, resets VWAP each session, and compares volume with earlier sessions'
-same clock-time bar. Online `shadow`/`gate` review is synchronous. The signal is
-checked before it and then finally rechecked and rebuilt for age, price,
-breakout distance, cost, and capacity after the possibly slow review.
+depth/circuit checks, and historical candles only for the shortlist. One
+captured cutoff now governs the historical request, closed-bar filter, and
+strict current-session continuity check. The setup engine fails closed on a
+missing, duplicate, misaligned, malformed, partial, or stale current-session
+bar. It warms EMA/RSI/ATR over earlier sessions, resets VWAP each session, and
+compares both breakout-bar volume at the same clock time and the complete
+15-minute opening volume with earlier sessions.
+
+The setup must be the first directional candle close beyond the opening range.
+Online `shadow`/`gate` review is synchronous. Revalidation uses ask for LONG and
+bid for SHORT, preserves the original signal close as the immutable drift
+baseline, checks the exchange quote timestamp after broker I/O, and reapplies
+spread, circuit, breakout, and VWAP-extension gates. A final post-account-
+preflight revalidation and a timestamp-only check after durable intent prevent
+stale broker mutation.
 
 These are sensible live-data causality controls, but they are not a backtest.
 They have not established that ORB/VWAP/EMA/RSI/RVOL has positive expectancy.
+
+### Part 3 evidence and limits
+
+The strongest directly relevant evidence found was a recent opening-range
+working paper: its unfiltered strategy did not establish an edge, while its
+particular completed five-minute opening-candle direction rule and same-window
+relative-volume selection materially improved the reported U.S. sample. This
+bot retains a different 15-minute range and requires a directional breakout
+candle, so the paper supports causal range/volume construction rather than this
+exact rule or threshold. It has limited external validity for NSE single stocks
+and does not provide an untouched final holdout:
+[Swiss Finance Institute Research Paper 24-98](https://www.alexandria.unisg.ch/server/api/core/bitstreams/3c2989c4-688d-4d78-8a71-f02690990d51/content).
+
+Kite documents historical candles as timestamped OHLCV records and live quotes
+as exchange snapshots with depth and exchange timestamps. Therefore historical
+bars are used only after a causal close/grace boundary, while submission uses
+the currently executable side of a fresh depth snapshot:
+[Kite historical data](https://kite.trade/docs/connect/v3/historical/),
+[Kite market quotes](https://kite.trade/docs/connect/v3/market-quotes/), and
+[Kite WebSocket fields](https://kite.trade/docs/connect/v3/websocket/).
+
+VWAP alignment and volatility-normalized chase limits remain plausible filters,
+not independently proven profit sources. Execution cost is mandatory because
+NSE defines impact cost as quantity- and order-book-dependent rather than a
+fixed constant: [NSE impact-cost methodology](https://www.nseindia.com/static/products-services/indices-impact-cost).
+No reviewed source establishes universal NSE thresholds for RVOL, ATR distance,
+VWAP extension, RSI, or opening-range length. Those parameters still require a
+registered, cost-aware chronological walk-forward evaluation and one untouched
+holdout; tuning them against the small live journal would be overfitting.
 
 ### Broker state is authoritative
 
@@ -49,11 +87,11 @@ may still be rejected by exchange price-protection rules.
   it remains paper-research only.
 - AI never changes size, stops, or hard daily/position limits.
 
-The online reviewer sees the supplied setup, including identifiers and
-categorical fields. The separate offline worker removes direct identifiers,
-timestamp, and composite scores, but its payload is only identifier-stripped,
-not guaranteed anonymous. Neither path has privileged future, news, order-book,
-or fill information. AI confidence is not a probability of profit.
+Both the online reviewer and separate offline worker remove direct identifiers,
+provenance timestamps, and composite scores from model input. Their payloads
+are only identifier-stripped, not guaranteed anonymous. Neither path has
+privileged future, news, order-book, or fill information. AI confidence is not
+a probability of profit.
 
 ## Remaining validation and measurement blockers
 
@@ -155,10 +193,12 @@ schema, or threshold change as a new trial. See the official
 - V3.2 reserves aggregate open-stop risk and gross exposure before entry, but
   sector, correlation, beta, net-directional and aggregate gap-risk controls
   remain absent.
-- The configured WebSocket age now defaults to 30 seconds and validation rejects
-  values over 60; the full-quote response still does not refresh every ranking
+- The configured WebSocket age defaults to 30 seconds and validation rejects
+  values over 60. Full/execution quotes now retain and validate the exchange
+  timestamp, but the full-quote response still does not refresh every ranking
   field.
-- NIFTY and setup data now explicitly require today's session.
+- NIFTY and setup data now require a complete, contiguous current session
+  through the causal cutoff.
 - Live monitoring now checks exact stop identity and pending quantity against
   broker position quantity; account-wide fencing across another machine or
   clone remains unresolved.
