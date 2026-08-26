@@ -1,4 +1,4 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.3
+# Zerodha Kite + GPT AI Intraday Bot V3.5
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
@@ -36,7 +36,7 @@ final live revalidation + trade rebuild + capacity reservation
 paper execution or guarded MIS order workflow
 ```
 
-V3.3 shards the dynamic NSE EQ universe across up to three WebSocket
+V3.5 shards the dynamic NSE EQ universe across up to three WebSocket
 connections. The default is 2,800 instruments per socket, below Kite's
 documented 3,000-instrument limit. All sockets update one thread-safe tick
 store; no fixed watchlist is required.
@@ -221,7 +221,7 @@ rejected. The process verifies its public IPv4 against `KITE_STATIC_IP` before
 live broker operation. These are mistake-prevention controls, not evidence that
 the strategy is safe, compliant, or profitable.
 
-### Dedicated-account recovery (V3.3)
+### Dedicated-account recovery (V3.5)
 
 If this Zerodha account is used only by this bot for NSE/MIS intraday activity,
 you may explicitly set:
@@ -241,12 +241,23 @@ mutations, and active orders are terminalized again after flat verification so
 an orphan stop cannot reverse a flat account. Non-dedicated mode retains the
 original fail-closed ownership checks.
 
-V3.3 also treats a broker-issued persisted `order_id` as the primary identity of
+V3.5 persists a dedicated-recovery intent before its first broker mutation and
+updates it before submission and immediately after an order ID is known. An
+unresolved intent survives a process restart and blocks all automatic startup
+mutation until orders and positions are reconciled manually. Recovery will not
+retry after an ambiguous order lifecycle, a terminal identity mismatch, stale
+position settlement, or fills observed around cancellation; these cases can
+leave exposure for manual handling, but cannot silently submit a second order.
+
+V3.5 also treats a broker-issued persisted `order_id` as the primary identity of
 an order after submission. A missing `tag` in an asynchronous/history payload no
-longer makes the bot disown its own stop. An SL-M in `TRIGGER PENDING` with the
-correct side, quantity, trigger and broker order ID is considered armed. WebSocket
-order updates are deduplicated and treated as events/cache; REST order-book state
-is preferred for authoritative reconciliation. Kill-switch flatten retries are
+longer makes the bot disown its own stop. A broker-reported `SL` representation
+of the intended SL-M is accepted only as armed protection while it is actually
+trigger-pending with exact side, quantity, trigger, position and broker order ID.
+Terminal MARKET/LIMIT conversion shapes remain owned but are never mistaken for
+armed protection. WebSocket/REST order updates share a monotonic cache so stale
+payloads cannot regress a terminal order. Startup reconciles account exposure
+before starting market-data subscriptions. Kill-switch flatten retries are
 bounded; after the configured attempt count the state becomes
 `manual_intervention_required=true` and no further automatic broker mutations are
 issued.
@@ -348,10 +359,11 @@ logs/ai_ideas.jsonl         offline structured AI research output
 ```
 
 State writes are atomic and the lock prevents two local bot processes from
-running concurrently. Do not delete `bot_state.json` while a position or broker
-order may exist. After a crash or uncertain order response, reconcile broker
-orders and positions before resuming; never assume a timeout means no order was
-accepted.
+running concurrently. Dedicated recovery intents are stored in
+`bot_state.json`; an unresolved one deliberately prevents restart. Do not delete
+or manually clear that state while a position or broker order may exist. After a
+crash or uncertain order response, reconcile broker orders and positions before
+resuming; never assume a timeout means no order was accepted.
 
 ## Dynamic universe and broker constraints
 
