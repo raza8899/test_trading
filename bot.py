@@ -63,7 +63,21 @@ import signal
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect, KiteTicker
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from ai_review import (
+    AI_MAX_OUTPUT_TOKENS,
+    AI_OUTPUT_VERBOSITY,
+    AI_PROMPT_VERSION,
+    PROMPT_CACHE_MODE,
+    SUPPORTED_PROMPT_CACHE_TTLS,
+    AIDecision,
+    AIFailureDecision,
+    AIReviewOutcome,
+    AIUsageTotals,
+    OpenAIUsage,
+    build_openai_review_request,
+    build_prompt_cache_key,
+    extract_openai_usage,
+)
 from strategy_rules import (
     SetupRuleConfig,
     SetupRuleInput,
@@ -115,7 +129,15 @@ AI_MODE = os.getenv("AI_MODE", "off").strip().lower()
 AI_IDEA_MODE = os.getenv("AI_IDEA_MODE", "shadow").strip().lower()
 AI_IDEA_MAX_CANDIDATES = int(os.getenv("AI_IDEA_MAX_CANDIDATES", "8"))
 MAX_AI_REVIEWS_PER_SCAN = int(os.getenv("MAX_AI_REVIEWS_PER_SCAN", "3"))
-AI_PROMPT_VERSION = "nse-orb-review-v4"
+OPENAI_PROMPT_CACHE_ENABLED_RAW = os.getenv(
+    "OPENAI_PROMPT_CACHE_ENABLED",
+    "true",
+).strip().lower()
+OPENAI_PROMPT_CACHE_ENABLED = OPENAI_PROMPT_CACHE_ENABLED_RAW == "true"
+OPENAI_PROMPT_CACHE_TTL = os.getenv(
+    "OPENAI_PROMPT_CACHE_TTL",
+    "30m",
+).strip().lower()
 AI_IDEA_PROMPT_VERSION = "nse-candidate-ideas-v2"
 
 # Safety switch
@@ -284,6 +306,7 @@ SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
         Path(__file__),
+        BASE_DIR / "ai_review.py",
         BASE_DIR / "strategy_rules.py",
         BASE_DIR / "trading_core.py",
         BASE_DIR / "requirements.txt",
@@ -305,6 +328,11 @@ RUNTIME_MANIFEST: dict[str, Any] = {
         "prompt_version": AI_PROMPT_VERSION,
         "idea_prompt_version": AI_IDEA_PROMPT_VERSION,
         "reasoning_effort": OPENAI_REASONING_EFFORT,
+        "output_verbosity": AI_OUTPUT_VERBOSITY,
+        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
+        "prompt_cache_enabled": OPENAI_PROMPT_CACHE_ENABLED,
+        "prompt_cache_mode": PROMPT_CACHE_MODE,
+        "prompt_cache_ttl": OPENAI_PROMPT_CACHE_TTL,
         "timeout_seconds": OPENAI_TIMEOUT_SECONDS,
         "max_retries": OPENAI_MAX_RETRIES,
         "min_confidence": AI_MIN_CONFIDENCE,
@@ -540,18 +568,17 @@ class Trade:
     ai_decision_id: str = ""
     ai_input_sha256: str = ""
     ai_input_tokens: int = 0
+    ai_cached_input_tokens: int = 0
+    ai_cache_write_tokens: int = 0
     ai_output_tokens: int = 0
+    ai_reasoning_tokens: int = 0
     ai_total_tokens: int = 0
+    ai_cache_hit_ratio: float = 0.0
+    ai_api_called: bool = False
+    ai_duplicate_review_suppressed: bool = False
+    ai_source_input_sha256: str = ""
     accounting_uncertain: bool = False
     accounting_note: str = ""
-
-
-class AIDecision(BaseModel):
-    decision: Literal["APPROVE", "REJECT", "ERROR"]
-    confidence: int = Field(ge=0, le=100)
-    quality_score: int = Field(ge=0, le=100)
-    reason: str
-    risk_flags: list[str]
 
 
 @dataclass(frozen=True)
@@ -908,6 +935,13 @@ def validate_configuration() -> None:
         errors.append("AI_IDEA_MAX_CANDIDATES must be between 1 and 25")
     if not 1 <= MAX_AI_REVIEWS_PER_SCAN <= 10:
         errors.append("MAX_AI_REVIEWS_PER_SCAN must be between 1 and 10")
+    if OPENAI_PROMPT_CACHE_ENABLED_RAW not in {"true", "false"}:
+        errors.append("OPENAI_PROMPT_CACHE_ENABLED must be true or false")
+    if OPENAI_PROMPT_CACHE_TTL not in SUPPORTED_PROMPT_CACHE_TTLS:
+        errors.append(
+            "OPENAI_PROMPT_CACHE_TTL must be one of "
+            + ", ".join(sorted(SUPPORTED_PROMPT_CACHE_TTLS))
+        )
 
     if OPENAI_REASONING_EFFORT not in {
         "none", "low", "medium", "high", "xhigh", "max"
@@ -3842,8 +3876,57 @@ NOT expected probability of profit and NOT expected percentage return.
 setup after considering momentum, extension, execution quality and
 risk.
 
-Use risk_flags to identify the important reasons for concern.
-"""
+OUTPUT FORMAT:
+
+Return only the structured AIDecision object. Do not return ERROR; operational
+failures are handled by the caller.
+
+- decision: exactly APPROVE or REJECT.
+- confidence and quality_score: integers from 0 through 100.
+- reason: exactly one concise decision-summary sentence, approximately 35
+  words or fewer and no more than 250 characters.
+- risk_flags: zero to four standardized labels allowed by the schema; use an
+  empty list when no material concern applies.
+- Do not restate every input or explain every factor that passed.
+- Mention only factors that materially determined the decision.
+- Do not provide step-by-step reasoning, analysis, or prose outside the
+  structured fields.
+""".strip()
+
+
+AI_PROMPT_CACHE_KEY = build_prompt_cache_key(
+    model=OPENAI_MODEL,
+    prompt_version=AI_PROMPT_VERSION,
+    system_prompt=AI_SYSTEM_PROMPT,
+)
+
+
+def build_ai_review_signal_key(setup: Setup) -> tuple[str, str, str, str]:
+    """Identify one immutable strategy signal before model anonymization."""
+    signal_bar = setup.signal_bar_closed_at or setup.signal_at
+    return (
+        f"{STRATEGY_VERSION}:{RUNTIME_CONFIG_FINGERPRINT}",
+        setup.symbol.strip().upper(),
+        setup.side,
+        signal_bar,
+    )
+
+
+@dataclass(frozen=True)
+class _CachedAIReview:
+    decision: AIDecision
+    response_model: str
+    response_id: str
+    decision_id: str
+    source_input_sha256: str
+
+
+def _safe_response_text(response: Any, name: str) -> str:
+    try:
+        value = getattr(response, name, "")
+    except Exception:
+        return ""
+    return str(value or "")
 
 
 class AIFilter:
@@ -3858,64 +3941,117 @@ class AIFilter:
             timeout=OPENAI_TIMEOUT_SECONDS,
             max_retries=OPENAI_MAX_RETRIES,
         )
+        self.usage_totals = AIUsageTotals()
+        self._review_cache: dict[
+            tuple[tuple[str, str, str, str], str],
+            _CachedAIReview,
+        ] = {}
+        self._reset_trace(input_sha256="", status="NOT_RUN")
+
+    def _reset_trace(self, *, input_sha256: str, status: str) -> None:
         self.last_response_model = ""
         self.last_response_id = ""
         self.last_latency_ms = 0
         self.last_error = ""
-        self.last_status = "NOT_RUN"
+        self.last_status = status
         self.last_decision_id = ""
-        self.last_input_sha256 = ""
+        self.last_input_sha256 = input_sha256
+        self.last_source_input_sha256 = input_sha256
+        self.last_prompt_cache_key = (
+            AI_PROMPT_CACHE_KEY if OPENAI_PROMPT_CACHE_ENABLED else ""
+        )
+        self.last_prompt_cache_options_sent = False
+        self.last_prompt_cache_mode = ""
+        self.last_prompt_cache_ttl = ""
+        self.last_api_called = False
+        self.last_duplicate_review_suppressed = False
         self.last_input_tokens = 0
+        self.last_cached_input_tokens = 0
+        self.last_cache_write_tokens = 0
         self.last_output_tokens = 0
+        self.last_reasoning_tokens = 0
         self.last_total_tokens = 0
+        self.last_cache_hit_ratio = 0.0
+
+    def _set_usage_trace(self, usage: OpenAIUsage) -> None:
+        """Best-effort telemetry assignment, isolated from decision validity."""
+        try:
+            self.last_input_tokens = usage.input_tokens
+            self.last_cached_input_tokens = usage.cached_input_tokens
+            self.last_cache_write_tokens = usage.cache_write_tokens
+            self.last_output_tokens = usage.output_tokens
+            self.last_reasoning_tokens = usage.reasoning_tokens
+            self.last_total_tokens = usage.total_tokens
+            self.last_cache_hit_ratio = usage.cache_hit_ratio
+        except Exception:
+            # Usage observability must never turn a valid provider decision
+            # into an execution-blocking AI failure.
+            pass
+
+    def has_cached_review(
+        self,
+        review_key: tuple[str, str, str, str],
+        candidate_payload: dict[str, Any],
+    ) -> bool:
+        """Return true only for the same signal and exact reviewed payload."""
+        input_sha256 = stable_json_sha256(candidate_payload)
+        return (review_key, input_sha256) in self._review_cache
 
     def review(
         self,
         candidate_payload: dict[str, Any],
-    ) -> AIDecision:
+        *,
+        review_key: tuple[str, str, str, str] | None = None,
+    ) -> AIReviewOutcome:
         started = time.monotonic()
-        self.last_response_model = ""
-        self.last_response_id = ""
-        self.last_latency_ms = 0
-        self.last_error = ""
-        self.last_status = "RUNNING"
+        input_sha256 = stable_json_sha256(candidate_payload)
+        self._reset_trace(input_sha256=input_sha256, status="RUNNING")
+
+        cache_identity = (
+            (review_key, input_sha256)
+            if review_key is not None
+            else None
+        )
+        cached = (
+            self._review_cache.get(cache_identity)
+            if cache_identity is not None
+            else None
+        )
+        if cached is not None:
+            self.last_response_model = cached.response_model
+            self.last_response_id = cached.response_id
+            self.last_decision_id = cached.decision_id
+            self.last_source_input_sha256 = cached.source_input_sha256
+            self.last_status = "DUPLICATE_REUSED"
+            self.last_duplicate_review_suppressed = True
+            self.usage_totals.duplicate_reviews_suppressed += 1
+            return cached.decision
+
         self.last_decision_id = uuid.uuid4().hex
-        self.last_input_tokens = 0
-        self.last_output_tokens = 0
-        self.last_total_tokens = 0
-        self.last_input_sha256 = stable_json_sha256(candidate_payload)
+        self.last_api_called = True
+        usage = OpenAIUsage()
 
         try:
-            response = self.client.responses.parse(
+            request = build_openai_review_request(
+                candidate_payload,
                 model=OPENAI_MODEL,
-                input=[
-                    {
-                        "role": "system",
-                        "content": AI_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                                "Review this candidate:\n"
-                                + json.dumps(
-                                candidate_payload,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                allow_nan=False,
-                            )
-                        ),
-                    },
-                ],
-                text_format=AIDecision,
-                reasoning={"effort": OPENAI_REASONING_EFFORT},
-                max_output_tokens=600,
-                store=False,
-                metadata={
-                    "workflow": "nse_intraday_review",
-                    "prompt_version": AI_PROMPT_VERSION,
-                },
-                timeout=OPENAI_TIMEOUT_SECONDS,
+                prompt_version=AI_PROMPT_VERSION,
+                system_prompt=AI_SYSTEM_PROMPT,
+                reasoning_effort=OPENAI_REASONING_EFFORT,
+                timeout_seconds=OPENAI_TIMEOUT_SECONDS,
+                prompt_cache_enabled=OPENAI_PROMPT_CACHE_ENABLED,
+                prompt_cache_ttl=OPENAI_PROMPT_CACHE_TTL,
             )
+            self.last_prompt_cache_options_sent = (
+                "prompt_cache_options" in request
+            )
+            if self.last_prompt_cache_options_sent:
+                options = request["prompt_cache_options"]
+                self.last_prompt_cache_mode = str(options.get("mode") or "")
+                self.last_prompt_cache_ttl = str(options.get("ttl") or "")
+            response = self.client.responses.parse(**request)
+            usage = extract_openai_usage(response)
+            self._set_usage_trace(usage)
 
             decision = response.output_parsed
 
@@ -3923,22 +4059,35 @@ class AIFilter:
                 raise RuntimeError(
                     "No structured AI output."
                 )
-            if decision.decision == "ERROR":
-                raise RuntimeError("AI returned reserved ERROR decision")
+            if not isinstance(decision, AIDecision):
+                decision = AIDecision.model_validate(decision)
 
-            self.last_response_model = str(response.model)
-            self.last_response_id = str(response.id)
-            usage = getattr(response, "usage", None)
-            self.last_input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-            self.last_output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-            self.last_total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            self.last_response_model = _safe_response_text(response, "model")
+            self.last_response_id = _safe_response_text(response, "id")
             self.last_latency_ms = int(
                 (time.monotonic() - started) * 1000
             )
             self.last_status = "OK"
+            try:
+                self.usage_totals.record_call(usage, successful=True)
+            except Exception:
+                pass
+            if cache_identity is not None:
+                self._review_cache[cache_identity] = _CachedAIReview(
+                    decision=decision,
+                    response_model=self.last_response_model,
+                    response_id=self.last_response_id,
+                    decision_id=self.last_decision_id,
+                    source_input_sha256=input_sha256,
+                )
             return decision
 
         except Exception as exc:
+            self._set_usage_trace(usage)
+            try:
+                self.usage_totals.record_call(usage, successful=False)
+            except Exception:
+                pass
             self.last_latency_ms = int(
                 (time.monotonic() - started) * 1000
             )
@@ -3949,10 +4098,7 @@ class AIFilter:
                 "Gate mode blocks; shadow mode remains execution-neutral."
             )
 
-            return AIDecision(
-                decision="ERROR",
-                confidence=0,
-                quality_score=0,
+            return AIFailureDecision(
                 reason=(
                     "AI service/review failure; "
                     "fail-closed."
@@ -4747,8 +4893,15 @@ def rebuild_trade_for_submission(
         "ai_decision_id",
         "ai_input_sha256",
         "ai_input_tokens",
+        "ai_cached_input_tokens",
+        "ai_cache_write_tokens",
         "ai_output_tokens",
+        "ai_reasoning_tokens",
         "ai_total_tokens",
+        "ai_cache_hit_ratio",
+        "ai_api_called",
+        "ai_duplicate_review_suppressed",
+        "ai_source_input_sha256",
     ):
         setattr(trade, name, getattr(original, name))
     return rebuilt
@@ -6407,9 +6560,18 @@ def mark_trade_closed(
             ai_prompt_version=trade.ai_prompt_version,
             ai_decision_id=trade.ai_decision_id,
             ai_input_sha256=trade.ai_input_sha256,
+            ai_source_input_sha256=trade.ai_source_input_sha256,
             ai_input_tokens=trade.ai_input_tokens,
+            ai_cached_input_tokens=trade.ai_cached_input_tokens,
+            ai_cache_write_tokens=trade.ai_cache_write_tokens,
             ai_output_tokens=trade.ai_output_tokens,
+            ai_reasoning_tokens=trade.ai_reasoning_tokens,
             ai_total_tokens=trade.ai_total_tokens,
+            ai_cache_hit_ratio=trade.ai_cache_hit_ratio,
+            ai_api_called=trade.ai_api_called,
+            ai_duplicate_review_suppressed=(
+                trade.ai_duplicate_review_suppressed
+            ),
             entry_order_id=trade.entry_order_id,
             exit_order_ids=trade.exit_order_ids,
         )
@@ -7051,7 +7213,7 @@ def execute_trade(
     broker: KiteBroker,
     trade: Trade,
     setup: Setup,
-    ai_decision: AIDecision,
+    ai_decision: AIReviewOutcome,
     state: dict,
 ) -> None:
     """Persist each intent before mutation and verify entry + protection."""
@@ -7473,9 +7635,16 @@ def execute_trade(
         ai_prompt_version=trade.ai_prompt_version,
         ai_decision_id=trade.ai_decision_id,
         ai_input_sha256=trade.ai_input_sha256,
+        ai_source_input_sha256=trade.ai_source_input_sha256,
         ai_input_tokens=trade.ai_input_tokens,
+        ai_cached_input_tokens=trade.ai_cached_input_tokens,
+        ai_cache_write_tokens=trade.ai_cache_write_tokens,
         ai_output_tokens=trade.ai_output_tokens,
+        ai_reasoning_tokens=trade.ai_reasoning_tokens,
         ai_total_tokens=trade.ai_total_tokens,
+        ai_cache_hit_ratio=trade.ai_cache_hit_ratio,
+        ai_api_called=trade.ai_api_called,
+        ai_duplicate_review_suppressed=trade.ai_duplicate_review_suppressed,
         planned_risk=trade.planned_risk_amount,
         reserved_risk=trade.reserved_risk_amount,
         planned_target_profit=trade.planned_target_profit_amount,
@@ -8284,6 +8453,8 @@ def scan_for_new_trades(
             continue
         trade = built.trade
         review_candidate = build_ai_candidate_payload(setup, trade, capacity)
+        review_input = identifier_stripped_ai_payload(review_candidate)
+        review_signal_key = build_ai_review_signal_key(setup)
         review_idea_id = stable_json_sha256(review_candidate)[:24]
         if AI_MODE != "off":
             review_candidate_logged = journal_best_effort(
@@ -8308,27 +8479,27 @@ def scan_for_new_trades(
                 risk_flags=[],
             )
         elif ai is None:
-            decision = AIDecision(
-                decision="ERROR",
-                confidence=0,
-                quality_score=0,
+            decision = AIFailureDecision(
                 reason="AI unavailable.",
                 risk_flags=["AI_UNAVAILABLE"],
             )
-        elif ai_reviews_used >= MAX_AI_REVIEWS_PER_SCAN:
-            decision = AIDecision(
-                decision="ERROR",
-                confidence=0,
-                quality_score=0,
+        elif (
+            ai_reviews_used >= MAX_AI_REVIEWS_PER_SCAN
+            and not ai.has_cached_review(review_signal_key, review_input)
+        ):
+            decision = AIFailureDecision(
                 reason="Per-scan AI review budget exhausted.",
                 risk_flags=["AI_BUDGET_SKIPPED"],
             )
         else:
             decision = ai.review(
-                identifier_stripped_ai_payload(review_candidate)
+                review_input,
+                review_key=review_signal_key,
             )
-            ai_reviews_used += 1
             review_trace = ai
+            ai_reviews_used += int(
+                bool(getattr(review_trace, "last_api_called", True))
+            )
 
         log(
             f"AI {setup.symbol}: "
@@ -8357,10 +8528,85 @@ def scan_for_new_trades(
             review_status=getattr(review_trace, "last_status", "NOT_RUN"),
             latency_ms=getattr(review_trace, "last_latency_ms", 0),
             error=getattr(review_trace, "last_error", ""),
+            api_called=getattr(review_trace, "last_api_called", False),
+            duplicate_review_suppressed=getattr(
+                review_trace,
+                "last_duplicate_review_suppressed",
+                False,
+            ),
             input_sha256=getattr(review_trace, "last_input_sha256", ""),
+            source_input_sha256=getattr(
+                review_trace,
+                "last_source_input_sha256",
+                "",
+            ),
+            prompt_cache_enabled=OPENAI_PROMPT_CACHE_ENABLED,
+            prompt_cache_key=getattr(
+                review_trace,
+                "last_prompt_cache_key",
+                "",
+            ),
+            prompt_cache_options_sent=getattr(
+                review_trace,
+                "last_prompt_cache_options_sent",
+                False,
+            ),
+            prompt_cache_mode=getattr(
+                review_trace,
+                "last_prompt_cache_mode",
+                "",
+            ),
+            prompt_cache_ttl=getattr(
+                review_trace,
+                "last_prompt_cache_ttl",
+                "",
+            ),
             input_tokens=getattr(review_trace, "last_input_tokens", 0),
+            cached_input_tokens=getattr(
+                review_trace,
+                "last_cached_input_tokens",
+                0,
+            ),
+            cache_write_tokens=getattr(
+                review_trace,
+                "last_cache_write_tokens",
+                0,
+            ),
             output_tokens=getattr(review_trace, "last_output_tokens", 0),
+            reasoning_tokens=getattr(
+                review_trace,
+                "last_reasoning_tokens",
+                0,
+            ),
             total_tokens=getattr(review_trace, "last_total_tokens", 0),
+            cache_hit_ratio=getattr(
+                review_trace,
+                "last_cache_hit_ratio",
+                0.0,
+            ),
+            ai_input_tokens=getattr(review_trace, "last_input_tokens", 0),
+            ai_cached_input_tokens=getattr(
+                review_trace,
+                "last_cached_input_tokens",
+                0,
+            ),
+            ai_cache_write_tokens=getattr(
+                review_trace,
+                "last_cache_write_tokens",
+                0,
+            ),
+            ai_output_tokens=getattr(review_trace, "last_output_tokens", 0),
+            ai_reasoning_tokens=getattr(
+                review_trace,
+                "last_reasoning_tokens",
+                0,
+            ),
+            ai_total_tokens=getattr(review_trace, "last_total_tokens", 0),
+            ai_cache_hit_ratio=getattr(
+                review_trace,
+                "last_cache_hit_ratio",
+                0.0,
+            ),
             setup=asdict(setup),
         )
 
@@ -8466,9 +8712,40 @@ def scan_for_new_trades(
         trade.ai_prompt_version = AI_PROMPT_VERSION
         trade.ai_decision_id = getattr(review_trace, "last_decision_id", "")
         trade.ai_input_sha256 = getattr(review_trace, "last_input_sha256", "")
+        trade.ai_source_input_sha256 = getattr(
+            review_trace,
+            "last_source_input_sha256",
+            "",
+        )
         trade.ai_input_tokens = getattr(review_trace, "last_input_tokens", 0)
+        trade.ai_cached_input_tokens = getattr(
+            review_trace,
+            "last_cached_input_tokens",
+            0,
+        )
+        trade.ai_cache_write_tokens = getattr(
+            review_trace,
+            "last_cache_write_tokens",
+            0,
+        )
         trade.ai_output_tokens = getattr(review_trace, "last_output_tokens", 0)
+        trade.ai_reasoning_tokens = getattr(
+            review_trace,
+            "last_reasoning_tokens",
+            0,
+        )
         trade.ai_total_tokens = getattr(review_trace, "last_total_tokens", 0)
+        trade.ai_cache_hit_ratio = getattr(
+            review_trace,
+            "last_cache_hit_ratio",
+            0.0,
+        )
+        trade.ai_api_called = getattr(review_trace, "last_api_called", False)
+        trade.ai_duplicate_review_suppressed = getattr(
+            review_trace,
+            "last_duplicate_review_suppressed",
+            False,
+        )
 
         execute_trade(
             broker,
@@ -8630,6 +8907,7 @@ def _run_main() -> None:
 
     broker = None
     state = None
+    ai: AIFilter | None = None
 
     try:
         state = load_state()
@@ -8818,6 +9096,39 @@ def _run_main() -> None:
                 log(f"CRITICAL fatal-error flatten failed: {flatten_exc}")
         raise
     finally:
+        if ai is not None:
+            try:
+                log(ai.usage_totals.concise_log_line())
+            except Exception as exc:
+                log(f"AI usage summary log unavailable: {exc}")
+            try:
+                journal_best_effort(
+                    "AI_USAGE_SUMMARY",
+                    prompt_version=AI_PROMPT_VERSION,
+                    requested_model=OPENAI_MODEL,
+                    prompt_cache_enabled=OPENAI_PROMPT_CACHE_ENABLED,
+                    prompt_cache_key=(
+                        AI_PROMPT_CACHE_KEY
+                        if OPENAI_PROMPT_CACHE_ENABLED
+                        else ""
+                    ),
+                    prompt_cache_mode=(
+                        PROMPT_CACHE_MODE
+                        if OPENAI_PROMPT_CACHE_ENABLED
+                        else ""
+                    ),
+                    prompt_cache_ttl=(
+                        OPENAI_PROMPT_CACHE_TTL
+                        if OPENAI_PROMPT_CACHE_ENABLED
+                        else ""
+                    ),
+                    cache_backend_verified=(
+                        ai.usage_totals.cached_input_tokens > 0
+                    ),
+                    **ai.usage_totals.journal_fields(),
+                )
+            except Exception as exc:
+                log(f"AI usage summary journal unavailable: {exc}")
         if broker:
             broker.close()
 

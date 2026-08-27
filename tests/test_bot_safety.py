@@ -10,6 +10,7 @@ import unittest
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -351,6 +352,7 @@ class FakeAIReviewer:
     def __init__(self, decision):
         self.decision = decision
         self.review_calls: list[object] = []
+        self.review_keys: list[object] = []
         self.last_response_model = "fake-model"
         self.last_response_id = "fake-response"
         self.last_latency_ms = 1
@@ -359,12 +361,142 @@ class FakeAIReviewer:
         self.last_decision_id = "fake-decision"
         self.last_input_sha256 = "fake-input"
         self.last_input_tokens = 10
+        self.last_cached_input_tokens = 0
+        self.last_cache_write_tokens = 0
         self.last_output_tokens = 5
+        self.last_reasoning_tokens = 0
         self.last_total_tokens = 15
+        self.last_cache_hit_ratio = 0.0
+        self.last_api_called = True
+        self.last_duplicate_review_suppressed = False
+        self.last_source_input_sha256 = "fake-input"
+        self.last_prompt_cache_key = "fake-cache-key"
+        self.last_prompt_cache_options_sent = True
+        self.last_prompt_cache_mode = "explicit"
+        self.last_prompt_cache_ttl = "30m"
 
-    def review(self, setup):
+    def has_cached_review(self, review_key, candidate_payload):
+        return False
+
+    def review(self, setup, *, review_key=None):
         self.review_calls.append(setup)
+        self.review_keys.append(review_key)
         return self.decision
+
+
+class AIFilterContractTests(unittest.TestCase):
+    def _reviewer(self, responses):
+        client = mock.Mock()
+        client.responses.parse.side_effect = list(responses)
+        with (
+            mock.patch.object(bot, "OPENAI_API_KEY", "test-key"),
+            mock.patch.object(bot, "OpenAI", return_value=client),
+        ):
+            reviewer = bot.AIFilter()
+        return reviewer, client
+
+    @staticmethod
+    def _response(decision=None, *, usage=None):
+        return SimpleNamespace(
+            output_parsed=decision or approved_decision(),
+            model="gpt-5.6-sol-2026-08-01",
+            id="resp-test",
+            usage=usage,
+        )
+
+    def test_detailed_usage_is_recorded_without_changing_decision(self) -> None:
+        usage = SimpleNamespace(
+            input_tokens=1200,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=896,
+                cache_write_tokens=128,
+            ),
+            output_tokens=180,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=96),
+            total_tokens=1380,
+        )
+        reviewer, client = self._reviewer([self._response(usage=usage)])
+
+        decision = reviewer.review({"setup": {"rvol": 2.0}})
+
+        self.assertEqual(decision.decision, "APPROVE")
+        self.assertEqual(reviewer.last_cached_input_tokens, 896)
+        self.assertEqual(reviewer.last_cache_write_tokens, 128)
+        self.assertEqual(reviewer.last_reasoning_tokens, 96)
+        self.assertAlmostEqual(reviewer.last_cache_hit_ratio, 896 / 1200)
+        self.assertEqual(reviewer.usage_totals.calls, 1)
+        request = client.responses.parse.call_args.kwargs
+        self.assertEqual(request["max_output_tokens"], 400)
+        self.assertEqual(request["text"], {"verbosity": "low"})
+        self.assertEqual(
+            request["prompt_cache_options"],
+            {"mode": "explicit", "ttl": "30m"},
+        )
+
+    def test_usage_property_failure_never_invalidates_valid_review(self) -> None:
+        class HostileUsageResponse:
+            output_parsed = approved_decision()
+            model = "gpt-5.6-sol"
+            id = "resp-hostile"
+
+            @property
+            def usage(self):
+                raise RuntimeError("metrics failed")
+
+        reviewer, _ = self._reviewer([HostileUsageResponse()])
+
+        result = reviewer.review({"setup": {"rvol": 2.0}})
+
+        self.assertEqual(result.decision, "APPROVE")
+        self.assertEqual(reviewer.last_status, "OK")
+        self.assertEqual(reviewer.last_total_tokens, 0)
+        self.assertEqual(reviewer.usage_totals.successful_calls, 1)
+
+    def test_malformed_output_is_internal_error_and_fail_closed(self) -> None:
+        reviewer, _ = self._reviewer(
+            [self._response(decision=SimpleNamespace(decision="ERROR"))]
+        )
+
+        with mock.patch.object(bot, "log"):
+            result = reviewer.review({"setup": {"rvol": 2.0}})
+
+        self.assertIsInstance(result, bot.AIFailureDecision)
+        self.assertEqual(result.decision, "ERROR")
+        self.assertEqual(result.confidence, 0)
+        self.assertEqual(reviewer.last_status, "ERROR")
+        self.assertEqual(reviewer.usage_totals.failed_calls, 1)
+
+    def test_exact_duplicate_is_reused_but_new_signal_calls_provider(self) -> None:
+        reviewer, client = self._reviewer(
+            [self._response(), self._response()]
+        )
+        payload = {"setup": {"rvol": 2.0}}
+        first_key = ("strategy", "INFY", "LONG", "2026-08-27T10:00:00+05:30")
+        next_key = ("strategy", "INFY", "LONG", "2026-08-27T10:05:00+05:30")
+
+        first = reviewer.review(payload, review_key=first_key)
+        duplicate = reviewer.review(payload, review_key=first_key)
+        self.assertEqual(client.responses.parse.call_count, 1)
+        self.assertIs(first, duplicate)
+        self.assertEqual(reviewer.last_status, "DUPLICATE_REUSED")
+        self.assertFalse(reviewer.last_api_called)
+
+        reviewer.review(payload, review_key=next_key)
+        self.assertEqual(client.responses.parse.call_count, 2)
+        self.assertEqual(reviewer.usage_totals.calls, 2)
+        self.assertEqual(reviewer.usage_totals.duplicate_reviews_suppressed, 1)
+
+    def test_changed_payload_on_same_signal_is_not_reused(self) -> None:
+        reviewer, client = self._reviewer(
+            [self._response(), self._response()]
+        )
+        key = ("strategy", "INFY", "LONG", "2026-08-27T10:00:00+05:30")
+
+        reviewer.review({"setup": {"spread_bps": 2.0}}, review_key=key)
+        reviewer.review({"setup": {"spread_bps": 7.0}}, review_key=key)
+
+        self.assertEqual(client.responses.parse.call_count, 2)
+        self.assertEqual(reviewer.usage_totals.duplicate_reviews_suppressed, 0)
 
 
 class IsolatedBotTestCase(unittest.TestCase):
@@ -2357,7 +2489,7 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
             confidence=99,
             quality_score=10,
             reason="shadow rejection",
-            risk_flags=["TEST"],
+            risk_flags=["VOLATILITY_RISK"],
         )
         reviewer, execute = self._run_scan("shadow", rejection)
 
@@ -2394,6 +2526,17 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
         self.assertEqual(len(approved_reviewer.review_calls), 1)
         approved_execute.assert_called_once()
         self.assertIs(approved_execute.call_args.args[3], approval)
+
+    def test_gate_mode_never_turns_ai_error_into_approval(self) -> None:
+        failure = bot.AIFailureDecision(
+            reason="Malformed provider output; fail-closed.",
+            risk_flags=["AI_FAILURE"],
+        )
+
+        reviewer, execute = self._run_scan("gate", failure)
+
+        self.assertEqual(len(reviewer.review_calls), 1)
+        execute.assert_not_called()
 
 
 class ProductionOrderRecoveryRegressionTests(IsolatedBotTestCase):

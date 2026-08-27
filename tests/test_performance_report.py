@@ -19,6 +19,130 @@ def write_jsonl(path: Path, records: list[object], raw_lines: list[str] | None =
 
 
 class PerformanceReportTests(unittest.TestCase):
+    def test_ai_review_usage_includes_rejects_errors_cache_and_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            first = {
+                "event": "AI_REVIEW",
+                "event_id": "review-1",
+                "review_status": "OK",
+                "decision": "APPROVE",
+                "api_called": True,
+                "ai_input_tokens": 100,
+                "ai_cached_input_tokens": 80,
+                "ai_cache_write_tokens": 0,
+                "ai_output_tokens": 20,
+                "ai_reasoning_tokens": 8,
+                "ai_total_tokens": 120,
+                "latency_ms": 1000,
+                "prompt_version": "prompt-v5",
+                "response_model": "gpt-test",
+            }
+            write_jsonl(
+                path,
+                [
+                    first,
+                    first,
+                    {
+                        "event": "AI_REVIEW",
+                        "event_id": "review-2",
+                        "review_status": "ERROR",
+                        "decision": "ERROR",
+                        "api_called": True,
+                        "ai_input_tokens": 50,
+                        "ai_cached_input_tokens": 0,
+                        "ai_cache_write_tokens": 50,
+                        "ai_output_tokens": 10,
+                        "ai_reasoning_tokens": 4,
+                        "ai_total_tokens": 60,
+                        "latency_ms": 2000,
+                        "prompt_version": "prompt-v5",
+                        "response_model": "gpt-test",
+                    },
+                    {
+                        "event": "AI_REVIEW",
+                        "event_id": "review-3",
+                        "review_status": "DUPLICATE_REUSED",
+                        "decision": "APPROVE",
+                        "api_called": False,
+                        "duplicate_review_suppressed": True,
+                        "ai_input_tokens": 0,
+                        "ai_cached_input_tokens": 0,
+                        "ai_cache_write_tokens": 0,
+                        "ai_output_tokens": 0,
+                        "ai_reasoning_tokens": 0,
+                        "ai_total_tokens": 0,
+                    },
+                    {
+                        "event": "AI_REVIEW",
+                        "event_id": "review-legacy",
+                        "review_status": "OK",
+                        "decision": "REJECT",
+                        "input_tokens": 200,
+                        "output_tokens": 40,
+                        "total_tokens": 240,
+                        "latency_ms": 3000,
+                        "prompt_version": "prompt-v4",
+                        "response_model": "gpt-test-old",
+                    },
+                ],
+            )
+
+            report = performance_report.build_report([path])
+            usage = report["ai_usage"]
+
+            self.assertEqual(usage["review_events"], 4)
+            self.assertEqual(usage["api_calls"], 3)
+            self.assertEqual(usage["successful_calls"], 2)
+            self.assertEqual(usage["failed_calls"], 1)
+            self.assertEqual(usage["duplicate_reviews_suppressed"], 1)
+            self.assertEqual(usage["input_tokens"], 350)
+            self.assertEqual(usage["cached_input_tokens"], 80)
+            self.assertEqual(usage["cache_write_tokens"], 50)
+            self.assertEqual(usage["output_tokens"], 70)
+            self.assertEqual(usage["reasoning_tokens"], 12)
+            self.assertAlmostEqual(usage["cache_hit_rate"], 80 / 150)
+            self.assertTrue(usage["cache_backend_verified"])
+            self.assertEqual(
+                usage["diagnostics"]["duplicate_review_events"],
+                1,
+            )
+            self.assertIn("AI cache hit rate: 53.3%", performance_report.format_text_report(report))
+
+    def test_malformed_ai_usage_never_changes_valid_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_20260811.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "event": "AI_REVIEW",
+                        "event_id": "review-bad",
+                        "review_status": "OK",
+                        "decision": "APPROVE",
+                        "api_called": True,
+                        "ai_input_tokens": "100",
+                    },
+                    {
+                        "event": "CLOSE",
+                        "net_pnl": 8,
+                        "gross_pnl": 10,
+                        "fees": 2,
+                        "r_multiple": 0.4,
+                        "ai_decision": "APPROVE",
+                    },
+                ],
+            )
+
+            report = performance_report.build_report([path])
+
+            self.assertEqual(report["summary"]["net_pnl"], 8)
+            self.assertIsNone(report["ai_usage"]["input_tokens"])
+            self.assertEqual(
+                report["ai_usage"]["diagnostics"]["malformed_fields"],
+                {"invalid_field:ai_input_tokens": 1},
+            )
+
     def test_summary_drawdown_and_ai_shadow_cohorts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

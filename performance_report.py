@@ -94,6 +94,46 @@ class ParseDiagnostics:
         }
 
 
+@dataclass(frozen=True)
+class AIReviewUsageRecord:
+    """One AI_REVIEW event, independent of completed-trade accounting."""
+
+    source: str
+    line_number: int
+    event_id: str | None
+    status: str
+    decision: str
+    api_called: bool
+    duplicate_review_suppressed: bool
+    input_tokens: int | None
+    cached_input_tokens: int | None
+    cache_write_tokens: int | None
+    output_tokens: int | None
+    reasoning_tokens: int | None
+    total_tokens: int | None
+    latency_ms: float | None
+    prompt_version: str | None
+    response_model: str | None
+
+
+@dataclass
+class AIUsageDiagnostics:
+    review_events: int = 0
+    duplicate_review_events: int = 0
+    inferred_api_called_events: int = 0
+    malformed_fields: Counter[str] = field(default_factory=Counter)
+    file_errors: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "review_events": self.review_events,
+            "duplicate_review_events": self.duplicate_review_events,
+            "inferred_api_called_events": self.inferred_api_called_events,
+            "malformed_fields": dict(sorted(self.malformed_fields.items())),
+            "file_errors": list(self.file_errors),
+        }
+
+
 def _finite_number(value: Any) -> float | None:
     """Return a finite JSON number as float without coercing strings or bools."""
 
@@ -118,6 +158,32 @@ def _optional_text(
         if text:
             return text.lower() if lowercase else text
     return None
+
+
+def _optional_nonnegative_int(
+    payload: dict[str, Any],
+    *names: str,
+) -> tuple[int | None, str | None]:
+    for name in names:
+        if name not in payload:
+            continue
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, name
+        return value, None
+    return None, None
+
+
+def _optional_nonnegative_float(
+    payload: dict[str, Any],
+    name: str,
+) -> tuple[float | None, str | None]:
+    if name not in payload:
+        return None, None
+    value = _finite_number(payload[name])
+    if value is None or value < 0:
+        return None, name
+    return value, None
 
 
 def _close_event_to_trade(
@@ -258,6 +324,237 @@ def parse_trade_files(paths: Iterable[Path]) -> tuple[list[TradeRecord], ParseDi
             diagnostics.file_errors.append(f"{path}: {exc}")
 
     return trades, diagnostics
+
+
+def parse_ai_review_usage(
+    paths: Iterable[Path],
+) -> tuple[list[AIReviewUsageRecord], AIUsageDiagnostics]:
+    """Parse AI_REVIEW telemetry without affecting CLOSE/P&L eligibility."""
+    records: list[AIReviewUsageRecord] = []
+    diagnostics = AIUsageDiagnostics()
+    seen_event_ids: set[str] = set()
+    token_names = {
+        "input_tokens": ("ai_input_tokens", "input_tokens"),
+        "cached_input_tokens": (
+            "ai_cached_input_tokens",
+            "cached_input_tokens",
+        ),
+        "cache_write_tokens": (
+            "ai_cache_write_tokens",
+            "cache_write_tokens",
+        ),
+        "output_tokens": ("ai_output_tokens", "output_tokens"),
+        "reasoning_tokens": (
+            "ai_reasoning_tokens",
+            "reasoning_tokens",
+        ),
+        "total_tokens": ("ai_total_tokens", "total_tokens"),
+    }
+
+    for path in sorted(paths, key=lambda item: str(item)):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    try:
+                        payload = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    event = str(payload.get("event") or "").strip().upper()
+                    if event != "AI_REVIEW":
+                        continue
+                    diagnostics.review_events += 1
+
+                    event_id = _optional_text(payload, "event_id")
+                    if event_id and event_id in seen_event_ids:
+                        diagnostics.duplicate_review_events += 1
+                        continue
+                    if event_id:
+                        seen_event_ids.add(event_id)
+
+                    status = str(
+                        payload.get("review_status") or "UNKNOWN"
+                    ).strip().upper()
+                    decision = str(
+                        payload.get("decision") or ""
+                    ).strip().upper()
+                    raw_api_called = payload.get("api_called")
+                    if isinstance(raw_api_called, bool):
+                        api_called = raw_api_called
+                    else:
+                        # Legacy events did not record api_called. OK/ERROR were
+                        # emitted only after entering AIFilter.review; NOT_RUN
+                        # represented off/unavailable/budget cases.
+                        api_called = status in {"OK", "ERROR"}
+                        diagnostics.inferred_api_called_events += 1
+
+                    raw_duplicate = payload.get(
+                        "duplicate_review_suppressed"
+                    )
+                    duplicate = (
+                        raw_duplicate
+                        if isinstance(raw_duplicate, bool)
+                        else status == "DUPLICATE_REUSED"
+                    )
+
+                    counts: dict[str, int | None] = {}
+                    for field_name, aliases in token_names.items():
+                        value, invalid_name = _optional_nonnegative_int(
+                            payload,
+                            *aliases,
+                        )
+                        counts[field_name] = value
+                        if invalid_name:
+                            diagnostics.malformed_fields.update(
+                                [f"invalid_field:{invalid_name}"]
+                            )
+                    latency, invalid_latency = _optional_nonnegative_float(
+                        payload,
+                        "latency_ms",
+                    )
+                    if invalid_latency:
+                        diagnostics.malformed_fields.update(
+                            [f"invalid_field:{invalid_latency}"]
+                        )
+
+                    records.append(
+                        AIReviewUsageRecord(
+                            source=str(path),
+                            line_number=line_number,
+                            event_id=event_id,
+                            status=status,
+                            decision=decision,
+                            api_called=api_called,
+                            duplicate_review_suppressed=duplicate,
+                            input_tokens=counts["input_tokens"],
+                            cached_input_tokens=counts[
+                                "cached_input_tokens"
+                            ],
+                            cache_write_tokens=counts[
+                                "cache_write_tokens"
+                            ],
+                            output_tokens=counts["output_tokens"],
+                            reasoning_tokens=counts["reasoning_tokens"],
+                            total_tokens=counts["total_tokens"],
+                            latency_ms=latency,
+                            prompt_version=_optional_text(
+                                payload,
+                                "prompt_version",
+                            ),
+                            response_model=_optional_text(
+                                payload,
+                                "response_model",
+                            ),
+                        )
+                    )
+        except OSError as exc:
+            diagnostics.file_errors.append(f"{path}: {exc}")
+
+    return records, diagnostics
+
+
+def _nullable_sum(values: Sequence[int | None]) -> tuple[int | None, int]:
+    present = [value for value in values if value is not None]
+    return (sum(present), len(present)) if present else (None, 0)
+
+
+def summarize_ai_review_usage(
+    records: Sequence[AIReviewUsageRecord],
+    diagnostics: AIUsageDiagnostics,
+) -> dict[str, Any]:
+    """Aggregate real provider-call usage, preserving unavailable legacy data."""
+    actual_calls = [record for record in records if record.api_called]
+    successful = [
+        record
+        for record in actual_calls
+        if record.status == "OK" and record.decision in AI_COHORT_DECISIONS
+    ]
+    failed = [record for record in actual_calls if record not in successful]
+    tokens: dict[str, int | None] = {}
+    token_samples: dict[str, int] = {}
+    for name in (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        total, samples = _nullable_sum(
+            [getattr(record, name) for record in actual_calls]
+        )
+        tokens[name] = total
+        token_samples[name] = samples
+
+    cache_pairs = [
+        record
+        for record in actual_calls
+        if record.input_tokens is not None
+        and record.cached_input_tokens is not None
+    ]
+    cache_input = sum(record.input_tokens or 0 for record in cache_pairs)
+    cached_input = sum(
+        record.cached_input_tokens or 0 for record in cache_pairs
+    )
+    cache_hit_rate = (
+        cached_input / cache_input if cache_input > 0 else None
+    )
+    output_values = [
+        record.output_tokens
+        for record in actual_calls
+        if record.output_tokens is not None
+    ]
+    latency_values = [
+        record.latency_ms
+        for record in actual_calls
+        if record.latency_ms is not None
+    ]
+
+    cohort_counter = Counter(
+        (
+            record.prompt_version or "unknown",
+            record.response_model or "unknown",
+        )
+        for record in actual_calls
+    )
+    cohorts = [
+        {
+            "prompt_version": key[0],
+            "response_model": key[1],
+            "calls": count,
+        }
+        for key, count in sorted(cohort_counter.items())
+    ]
+
+    return {
+        "review_events": len(records),
+        "api_calls": len(actual_calls),
+        "successful_calls": len(successful),
+        "failed_calls": len(failed),
+        "duplicate_reviews_suppressed": sum(
+            record.duplicate_review_suppressed for record in records
+        ),
+        **tokens,
+        "token_field_samples": token_samples,
+        "cache_observed_calls": len(cache_pairs),
+        "cache_hit_rate": cache_hit_rate,
+        "cache_backend_verified": any(
+            (record.cached_input_tokens or 0) > 0 for record in cache_pairs
+        ),
+        "average_output_tokens": (
+            sum(output_values) / len(output_values)
+            if output_values
+            else None
+        ),
+        "average_latency_ms": (
+            math.fsum(latency_values) / len(latency_values)
+            if latency_values
+            else None
+        ),
+        "cohorts": cohorts,
+        "diagnostics": diagnostics.as_dict(),
+    }
 
 
 def _clean_float(value: float) -> float:
@@ -612,6 +909,11 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
     """Build an overall report and explicit APPROVE/REJECT cohorts."""
 
     records, diagnostics = parse_trade_files(paths)
+    ai_usage_records, ai_usage_diagnostics = parse_ai_review_usage(paths)
+    ai_usage = summarize_ai_review_usage(
+        ai_usage_records,
+        ai_usage_diagnostics,
+    )
     provenance = summarize_provenance(records)
     approve = [record for record in records if record.ai_decision == "APPROVE"]
     reject = [record for record in records if record.ai_decision == "REJECT"]
@@ -654,6 +956,7 @@ def build_report(paths: Sequence[Path]) -> dict[str, Any]:
             "REJECT": summarize_trades(reject),
             "ERROR": summarize_trades(ai_errors),
         },
+        "ai_usage": ai_usage,
         "warnings": warnings,
     }
 
@@ -692,6 +995,7 @@ def format_text_report(report: dict[str, Any]) -> str:
     diagnostics = report["diagnostics"]
     provenance = report["provenance"]
     ai_provenance = provenance["ai"]
+    ai_usage = report["ai_usage"]
     fee_provenance = provenance["fees"]
     lines = [
         "Intraday bot performance report",
@@ -714,6 +1018,30 @@ def format_text_report(report: dict[str, Any]) -> str:
         + (_counted_values(ai_provenance["response_models"]) or "none recorded"),
         "AI prompt versions: "
         + (_counted_values(ai_provenance["prompt_versions"]) or "none recorded"),
+        (
+            "AI review usage: "
+            f"events={ai_usage['review_events']}, "
+            f"API calls={ai_usage['api_calls']}, "
+            f"successes={ai_usage['successful_calls']}, "
+            f"errors={ai_usage['failed_calls']}, "
+            f"duplicates={ai_usage['duplicate_reviews_suppressed']}"
+        ),
+        (
+            "AI tokens: "
+            f"input={ai_usage['input_tokens'] if ai_usage['input_tokens'] is not None else 'N/A'}, "
+            f"cached={ai_usage['cached_input_tokens'] if ai_usage['cached_input_tokens'] is not None else 'N/A'}, "
+            f"cache_write={ai_usage['cache_write_tokens'] if ai_usage['cache_write_tokens'] is not None else 'N/A'}, "
+            f"output={ai_usage['output_tokens'] if ai_usage['output_tokens'] is not None else 'N/A'}, "
+            f"reasoning={ai_usage['reasoning_tokens'] if ai_usage['reasoning_tokens'] is not None else 'N/A'}"
+        ),
+        (
+            "AI cache hit rate: "
+            + (
+                f"{ai_usage['cache_hit_rate']:.1%}"
+                if ai_usage["cache_hit_rate"] is not None
+                else "N/A (not recorded)"
+            )
+        ),
         "",
     ]
     overall_title = (
