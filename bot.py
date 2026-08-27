@@ -64,6 +64,11 @@ from dotenv import load_dotenv
 from kiteconnect import KiteConnect, KiteTicker
 from openai import OpenAI
 from pydantic import BaseModel, Field
+from strategy_rules import (
+    SetupRuleConfig,
+    SetupRuleInput,
+    evaluate_setup_rules,
+)
 from trading_core import (
     NSE_EQUITY_INTRADAY_FEE_MODEL_VERSION,
     OrderSnapshot,
@@ -271,11 +276,12 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.7-causal-entry-quality-20260826"
+STRATEGY_VERSION = "3.8-replay-rule-parity-20260827"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
         Path(__file__),
+        BASE_DIR / "strategy_rules.py",
         BASE_DIR / "trading_core.py",
         BASE_DIR / "requirements.txt",
     )
@@ -3495,10 +3501,6 @@ def detect_setup(
         or math.isnan(vwap)
     ):
         return None
-    signal_day_change_pct = (
-        (price - quote.prev_close) / quote.prev_close * 100
-    )
-
     rvol_value = (
         float(last["rvol"])
         if pd.notna(last["rvol"])
@@ -3522,160 +3524,53 @@ def detect_setup(
         else 0.5
     )
 
-    atr_pct = atr_value / price
-
-    if not (
-        MIN_ATR_PCT
-        <= atr_pct
-        <= MAX_ATR_PCT
-    ):
-        return None
-
-    if (
-        rvol_value < MIN_RVOL
-        or opening_rvol_value < MIN_OPENING_RVOL
-    ):
-        return None
-
-    if body_ratio < 0.30:
-        return None
-
     prior_post_opening_closes = today.iloc[3:-1]["close"]
-    long_fresh = bool(
-        prior_post_opening_closes.empty
-        or (prior_post_opening_closes <= opening_high).all()
+    rules = evaluate_setup_rules(
+        SetupRuleInput(
+            price=price,
+            candle_open=candle_open,
+            prev_close=quote.prev_close,
+            opening_high=opening_high,
+            opening_low=opening_low,
+            ema9=ema9,
+            ema20=ema20,
+            vwap=vwap,
+            rsi=rsi_value,
+            atr=atr_value,
+            rvol=rvol_value,
+            opening_rvol=opening_rvol_value,
+            body_ratio=body_ratio,
+            close_location=close_location,
+            nifty_regime=nifty_regime,
+            stock_in_play_score=quote.stock_in_play_score,
+            spread_bps=quote.spread_bps,
+            prior_post_opening_max_close=(
+                None
+                if prior_post_opening_closes.empty
+                else float(prior_post_opening_closes.max())
+            ),
+            prior_post_opening_min_close=(
+                None
+                if prior_post_opening_closes.empty
+                else float(prior_post_opening_closes.min())
+            ),
+        ),
+        SetupRuleConfig(
+            min_rvol=MIN_RVOL,
+            min_opening_rvol=MIN_OPENING_RVOL,
+            min_atr_pct=MIN_ATR_PCT,
+            max_atr_pct=MAX_ATR_PCT,
+            max_vwap_distance_atr=MAX_VWAP_DISTANCE_ATR,
+            min_breakout_distance_atr=MIN_BREAKOUT_DISTANCE_ATR,
+            max_breakout_distance_atr=MAX_BREAKOUT_DISTANCE_ATR,
+            long_min_day_change_pct=LONG_MIN_DAY_CHANGE_PCT,
+            short_max_day_change_pct=SHORT_MAX_DAY_CHANGE_PCT,
+            max_spread_bps=MAX_SPREAD_BPS,
+        ),
     )
-    short_fresh = bool(
-        prior_post_opening_closes.empty
-        or (prior_post_opening_closes >= opening_low).all()
-    )
-
-    long_breakout_atr = (
-        price - opening_high
-    ) / atr_value
-
-    short_breakout_atr = (
-        opening_low - price
-    ) / atr_value
-
-    vwap_distance_atr = (
-        abs(price - vwap) / atr_value
-    )
-
-    if (
-        vwap_distance_atr
-        > MAX_VWAP_DISTANCE_ATR
-    ):
+    if not rules.accepted or rules.side is None:
         return None
-
-    long_setup = (
-        long_fresh
-        and price > candle_open
-        and MIN_BREAKOUT_DISTANCE_ATR
-            <= long_breakout_atr
-            <= MAX_BREAKOUT_DISTANCE_ATR
-        and price > vwap
-        and ema9 > ema20
-        and 50 <= rsi_value <= 76
-        and close_location >= 0.58
-        and signal_day_change_pct >= LONG_MIN_DAY_CHANGE_PCT
-        and nifty_regime != "BEAR"
-    )
-
-    short_setup = (
-        short_fresh
-        and price < candle_open
-        and MIN_BREAKOUT_DISTANCE_ATR
-            <= short_breakout_atr
-            <= MAX_BREAKOUT_DISTANCE_ATR
-        and price < vwap
-        and ema9 < ema20
-        and 24 <= rsi_value <= 50
-        and close_location <= 0.45
-        and signal_day_change_pct <= SHORT_MAX_DAY_CHANGE_PCT
-        and nifty_regime != "BULL"
-    )
-
-    if not long_setup and not short_setup:
-        return None
-
-    side: Literal["LONG", "SHORT"] = (
-        "LONG"
-        if long_setup
-        else "SHORT"
-    )
-
-    breakout_distance_atr = (
-        long_breakout_atr
-        if side == "LONG"
-        else short_breakout_atr
-    )
-
-    score = 0.0
-
-    score += min(
-        28.0,
-        quote.stock_in_play_score * 0.28,
-    )
-
-    score += min(
-        20.0,
-        max(
-            0.0,
-            (rvol_value - 1.0)
-            / 2.0
-            * 20,
-        ),
-    )
-
-    score += min(
-        12.0,
-        body_ratio * 12,
-    )
-
-    if (
-        0.10
-        <= breakout_distance_atr
-        <= 0.55
-    ):
-        score += 12
-    elif breakout_distance_atr <= 0.70:
-        score += 8
-    else:
-        score += 4
-
-    score += max(
-        0.0,
-        10.0 * (
-            1
-            - min(
-                vwap_distance_atr,
-                MAX_VWAP_DISTANCE_ATR,
-            )
-            / MAX_VWAP_DISTANCE_ATR
-        ),
-    )
-
-    aligned = (
-        side == "LONG"
-        and nifty_regime == "BULL"
-    ) or (
-        side == "SHORT"
-        and nifty_regime == "BEAR"
-    )
-
-    score += 10 if aligned else 6
-
-    score += max(
-        0.0,
-        8 * (
-            1
-            - quote.spread_bps
-            / MAX_SPREAD_BPS
-        ),
-    )
-
-    score = min(100.0, score)
+    side = rules.side
 
     return Setup(
         symbol=quote.symbol,
@@ -3684,7 +3579,7 @@ def detect_setup(
 
         price=price,
         prev_close=quote.prev_close,
-        day_change_pct=signal_day_change_pct,
+        day_change_pct=rules.day_change_pct,
         gap_pct=quote.gap_pct,
         turnover_crore=quote.turnover_crore,
         spread_bps=quote.spread_bps,
@@ -3698,18 +3593,18 @@ def detect_setup(
         ema20=ema20,
         rsi=rsi_value,
         atr=atr_value,
-        atr_pct=atr_pct,
+        atr_pct=rules.atr_pct,
         rvol=rvol_value,
 
-        breakout_distance_atr=breakout_distance_atr,
-        vwap_distance_atr=vwap_distance_atr,
+        breakout_distance_atr=rules.breakout_distance_atr,
+        vwap_distance_atr=rules.vwap_distance_atr,
         candle_body_ratio=body_ratio,
         candle_close_location=close_location,
 
         nifty_regime=nifty_regime,
         nifty_return_pct=nifty_return_pct,
 
-        technical_score=score,
+        technical_score=rules.technical_score,
         signal_at=signal_bar_closed_at.isoformat(),
         lower_circuit_limit=quote.lower_circuit_limit,
         upper_circuit_limit=quote.upper_circuit_limit,

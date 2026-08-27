@@ -1,4 +1,4 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.7
+# Zerodha Kite + GPT AI Intraday Bot V3.8
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
@@ -215,6 +215,58 @@ compatible, mixed, or unverifiable when execution mode, configuration
 fingerprint, response model, or prompt version differ or are missing. The P&L
 aggregate remains calculable for legacy records, but a warning does not make
 mixed experiments comparable or causal.
+
+## Point-in-time replay (Part 4)
+
+`historical_replay.py` is an offline, deterministic validation layer. It uses
+the same pure scalar setup-rule kernel as `bot.detect_setup`, then applies
+chronological portfolio capacity, executable bid/ask entry references,
+top-of-book participation, adverse slippage, the effective NSE intraday charge
+model, an exit-side spread proxy of at least half the recorded entry spread,
+the live entry-cutoff guard and circuit buffer, stop/target/circuit geometry,
+and a forced 15:10 exit. If an unresolved five-minute bar can contain both stop
+and target, the stop wins. If the entry-containing bar's adverse extreme crosses
+the stop, it is booked as an explicitly counted worst-case assumption—not an
+observed fill—while a favorable target is never granted from that bar. A gap
+through a stop receives the worse bar-open price. It imports neither Kite nor
+OpenAI and does not read `.env`.
+
+If a realized daily-loss or consecutive-loss limit trips while another replay
+position is still open, the session is rejected. Live trading would immediately
+kill-switch and flatten that exposure, but bar OHLC has no executable quote for
+the emergency liquidation; allowing it to reach a later target would be
+optimistic.
+
+The input is deliberately strict and checksummed:
+
+```bash
+python historical_replay.py research_data/dataset_name
+cp replay_trials.example.json frozen_trials.json
+# Give the copied registry a real ID/time and register every planned variant
+# before examining the corresponding test/holdout outcomes.
+python historical_replay.py research_data/dataset_name \
+  --walk-forward --trials frozen_trials.json
+```
+
+Walk-forward selection uses only earlier training sessions, leaves a purge gap,
+freezes the selected configuration for each test fold, and reserves the final
+holdout unless `--evaluate-holdout` is explicitly supplied. Every tried
+configuration belongs in the frozen registry; the selection score is the lower
+one-sided 95% bound of mean trade R, subject to a minimum training sample.
+
+The current `logs/` directory is intentionally rejected:
+
+```text
+INSUFFICIENT_POINT_IN_TIME_DATA: logs has no manifest.json; trade journals are not replay data
+```
+
+Those journals contain only selected decisions and ten completed trades. They
+lack the historical universe, complete decision set, raw stock/NIFTY bars,
+depth, and causal execution path, so using them to optimize thresholds would be
+selection-biased. Replay output is always labelled
+`DERIVED_LEDGER_BAR_ONLY_LOW_FIDELITY`; even a valid result cannot demonstrate
+live fill behavior or guarantee profit. See [REPLAY_DATA_CONTRACT.md](REPLAY_DATA_CONTRACT.md)
+for the recorder and dataset requirements.
 
 ## Live-order guard
 

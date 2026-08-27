@@ -95,20 +95,32 @@ a probability of profit.
 
 ## Remaining validation and measurement blockers
 
-### 1. There is no historical replay or walk-forward engine
+### 1. The replay engine exists, but no valid historical dataset exists
 
-`performance_report.py` accounts for completed journal trades; it does not
-recreate the cross-sectional scan, order path, or rejected opportunities. A
-valid replay still needs:
+Part 4 adds a strict opportunity/portfolio replay and chronological
+walk-forward evaluator. The live detector and replay share one pure scalar rule
+kernel, so recorded feature rows use the same setup thresholds and score. The
+engine uses bid/ask references, visible-depth participation, adverse slippage,
+all modeled charges, portfolio capacity, the live entry-cutoff/circuit gates,
+gap-aware stops, explicitly counted worst-case entry-bar assumptions,
+stop-first ambiguous later bars, and an explicit final-holdout boundary. It
+rejects missing, modified, duplicate, non-causal, or incomplete inputs and never
+imports the broker or AI client.
+
+This is replay infrastructure, not profitability evidence. Its supported OHLC
+execution policy is explicitly low fidelity, and the repository has no dataset
+meeting [the point-in-time contract](REPLAY_DATA_CONTRACT.md). A full-parity
+recording still needs:
 
 - point-in-time instrument/series eligibility and corporate-action handling;
 - only information available by each simulated decision timestamp, with a bar
   finalization delay and an exchange calendar;
 - the entire cross-sectional ranking and portfolio-capacity competition;
 - bid/ask spread, impact, latency, partial/unfilled/rejected orders, all current
-  charges, and conservative ambiguous intrabar sequencing;
-- expanding or rolling walk-forward selection, frozen out-of-sample windows,
-  and one untouched final holdout.
+  charges, kill-switch liquidation quotes, and conservative ambiguous intrabar
+  sequencing;
+- raw data lineage behind the derived feature ledger and deterministic
+  cross-sectional tie-breaking.
 
 Downloading today's instrument master is causal for today's live scan, but
 reusing it for historical tests would introduce survivorship/eligibility bias.
@@ -126,8 +138,9 @@ rescues a leaky or unrealistic simulation.
 
 ### 2. Journals are insufficient for reproducible profit attribution
 
-V3.2 journals a normalized run manifest and hashes `bot.py`, `trading_core.py`,
-the pinned requirements file, and material configuration. After final
+V3.8 journals a normalized run manifest and hashes `bot.py`,
+`strategy_rules.py`, `trading_core.py`, the pinned requirements file, and
+material configuration. After final
 revalidation and trade rebuild it attempts to journal the final eligible
 candidate with a stable `idea_id`. That stream is cutoff- and capacity-truncated
 and is not the complete rejected-opportunity universe. Point-in-time
@@ -237,7 +250,8 @@ and
 
 ## Minimum evidence before any live canary
 
-1. Build the point-in-time recorder and cost-aware portfolio replay first.
+1. Complete the point-in-time recorder and populate the cost-aware replay with
+   contract-valid forward data; the engine alone is not evidence.
 2. Register all research trials; freeze parameters before each walk-forward
    window and evaluate one untouched final holdout once.
 3. Demonstrate stable after-cost results across regimes, symbols, sectors, and
