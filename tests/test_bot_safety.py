@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import dotenv
 import pandas as pd
+from kiteconnect.exceptions import InputException
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -435,6 +436,119 @@ class StrategyHelperSafetyTests(unittest.TestCase):
         self.assertEqual(clock.call_count, 1)
         self.assertEqual(candles["date"].iloc[-1].strftime("%H:%M"), "09:50")
         self.assertEqual(candles.attrs["causal_as_of"], pd.Timestamp(cutoff).isoformat())
+
+    def test_historical_candles_uses_kite_wire_dates_for_pandas_timestamps(self) -> None:
+        broker = bot.KiteBroker.__new__(bot.KiteBroker)
+        broker.kite = mock.Mock()
+        broker.kite.historical_data.return_value = []
+        start = pd.Timestamp("2026-08-06 11:11:04", tz="Asia/Kolkata")
+        end = pd.Timestamp("2026-08-27 11:11:04.987654", tz="Asia/Kolkata")
+
+        result = broker.historical_candles(256265, start, end)
+
+        self.assertTrue(result.empty)
+        broker.kite.historical_data.assert_called_once_with(
+            instrument_token=256265,
+            from_date="2026-08-06 11:11:04",
+            to_date="2026-08-27 11:11:04",
+            interval="5minute",
+            continuous=False,
+            oi=False,
+        )
+
+    def test_historical_request_dates_are_host_timezone_independent(self) -> None:
+        start = datetime(
+            2026,
+            8,
+            6,
+            5,
+            41,
+            4,
+            tzinfo=ZoneInfo("UTC"),
+        )
+        end = datetime(
+            2026,
+            8,
+            27,
+            5,
+            41,
+            4,
+            tzinfo=ZoneInfo("UTC"),
+        )
+
+        self.assertEqual(
+            bot.kite_historical_request_dates(start, end),
+            (
+                "2026-08-06 11:11:04",
+                "2026-08-27 11:11:04",
+            ),
+        )
+
+    def test_historical_candles_rejects_bad_range_before_broker_io(self) -> None:
+        broker = bot.KiteBroker.__new__(bot.KiteBroker)
+        broker.kite = mock.Mock()
+        observed = pd.Timestamp("2026-08-27 11:11:04", tz="Asia/Kolkata")
+
+        bad_ranges = (
+            (observed, observed),
+            (observed + pd.Timedelta(seconds=1), observed),
+            (
+                observed + pd.Timedelta(microseconds=100_000),
+                observed + pd.Timedelta(microseconds=900_000),
+            ),
+        )
+        for start, end in bad_ranges:
+            with self.subTest(start=start, end=end):
+                with self.assertRaisesRegex(ValueError, "earlier than to_date"):
+                    broker.historical_candles(256265, start, end)
+        with self.assertRaisesRegex(ValueError, "instrument_token must be positive"):
+            broker.historical_candles(0, observed, observed + pd.Timedelta(days=1))
+
+        broker.kite.historical_data.assert_not_called()
+
+    def test_historical_candle_failure_is_contextual_and_fail_closed(self) -> None:
+        broker = bot.KiteBroker.__new__(bot.KiteBroker)
+        broker.kite = mock.Mock()
+        broker.kite.historical_data.side_effect = InputException(
+            "invalid from date"
+        )
+        start = pd.Timestamp("2026-08-06 11:11:04", tz="Asia/Kolkata")
+        end = pd.Timestamp("2026-08-27 11:11:04", tz="Asia/Kolkata")
+
+        with self.assertRaisesRegex(
+            bot.HistoricalCandleError,
+            (
+                "token=256265 from=2026-08-06 11:11:04 "
+                "to=2026-08-27 11:11:04: InputException: invalid from date"
+            ),
+        ) as raised:
+            broker.historical_candles(256265, start, end)
+
+        self.assertIsInstance(raised.exception.__cause__, InputException)
+
+    def test_prior_session_only_candles_fail_closed_on_no_session_day(self) -> None:
+        prior = self._current_candle_frame()
+        prior["date"] = prior["date"] - pd.Timedelta(days=1)
+
+        result = bot.validated_strategy_candles(prior, as_of=FIXED_NOW)
+
+        self.assertTrue(result.empty)
+
+    def test_full_scan_failure_delay_is_exponential_and_capped(self) -> None:
+        with (
+            mock.patch.object(bot, "FULL_SCAN_EVERY_SECONDS", 30),
+            mock.patch.object(bot, "FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS", 300),
+        ):
+            delays = [
+                bot.full_scan_retry_delay_seconds(failures)
+                for failures in range(1, 8)
+            ]
+
+        self.assertEqual(delays, [30, 60, 120, 240, 300, 300, 300])
+        for invalid in (0, -1, True, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    bot.full_scan_retry_delay_seconds(invalid)
 
     def test_strategy_candle_validation_rejects_gaps_duplicates_and_partial_bars(self) -> None:
         frame = self._current_candle_frame()
@@ -1045,6 +1159,26 @@ class StrategyHelperSafetyTests(unittest.TestCase):
 
 
 class ConfigurationSafetyTests(unittest.TestCase):
+    def test_weekend_exits_before_state_or_broker_initialization(self) -> None:
+        saturday = datetime(
+            2026,
+            8,
+            15,
+            10,
+            0,
+            tzinfo=ZoneInfo("Asia/Kolkata"),
+        )
+        with (
+            mock.patch.object(bot, "now_ist", return_value=saturday),
+            mock.patch.object(bot, "load_state") as load_state,
+            mock.patch.object(bot, "KiteBroker") as broker_type,
+            mock.patch.object(bot, "log"),
+        ):
+            bot._run_main()
+
+        load_state.assert_not_called()
+        broker_type.assert_not_called()
+
     def test_live_mode_requires_exact_confirmation(self) -> None:
         with (
             mock.patch.object(bot, "LIVE_TRADING", True),
@@ -1073,6 +1207,18 @@ class ConfigurationSafetyTests(unittest.TestCase):
             mock.patch.object(bot, "RISK_SLIPPAGE_BPS", 0.0),
         ):
             with self.assertRaisesRegex(RuntimeError, "at least PAPER_SLIPPAGE"):
+                bot.validate_configuration()
+
+    def test_scan_backoff_and_historical_rate_must_be_safe(self) -> None:
+        with (
+            mock.patch.object(bot, "FULL_SCAN_EVERY_SECONDS", 30),
+            mock.patch.object(bot, "FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS", 20),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "BACKOFF_MAX_SECONDS"):
+                bot.validate_configuration()
+
+        with mock.patch.object(bot, "CANDLE_DELAY_SECONDS", 0.1):
+            with self.assertRaisesRegex(RuntimeError, "3 requests/second"):
                 bot.validate_configuration()
 
 
@@ -2109,6 +2255,42 @@ class AIModeScanSemanticsTests(IsolatedBotTestCase):
         detect.assert_not_called()
         broker.strategy_candles.assert_called_once_with(
             999,
+            as_of=mock.ANY,
+        )
+
+    def test_candidate_historical_failure_aborts_remaining_scan_requests(self) -> None:
+        broker = FakeBroker()
+        candidates = [
+            mock.Mock(symbol="INFY", token=123),
+            mock.Mock(symbol="TCS", token=456),
+        ]
+        broker.strategy_candles = mock.Mock(
+            side_effect=bot.HistoricalCandleError("historical transport failed")
+        )
+        state = bot.fresh_state()
+
+        with (
+            mock.patch.object(bot, "entry_window_open", return_value=True),
+            mock.patch.object(
+                bot,
+                "select_stocks_in_play",
+                return_value=candidates,
+            ),
+            mock.patch.object(
+                bot,
+                "get_nifty_regime",
+                return_value=("BULL", 0.5),
+            ),
+            mock.patch.object(bot.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                bot.HistoricalCandleError,
+                "historical transport failed",
+            ):
+                bot.scan_for_new_trades(broker, None, state)
+
+        broker.strategy_candles.assert_called_once_with(
+            123,
             as_of=mock.ANY,
         )
 

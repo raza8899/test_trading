@@ -229,6 +229,9 @@ FORCE_EXIT = dtime(15, 10)
 SESSION_END = dtime(15, 30)
 
 FULL_SCAN_EVERY_SECONDS = int(os.getenv("FULL_SCAN_EVERY_SECONDS", "180"))
+FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS = int(
+    os.getenv("FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS", "900")
+)
 POSITION_MONITOR_EVERY_SECONDS = int(
     os.getenv("POSITION_MONITOR_EVERY_SECONDS", "5")
 )
@@ -276,7 +279,7 @@ LOCK_FILE = DATA_DIR / "bot.lock"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-STRATEGY_VERSION = "3.8-replay-rule-parity-20260827"
+STRATEGY_VERSION = "3.8.1-kite-historical-date-hotfix-20260827"
 SOURCE_SHA256 = {
     path.name: hashlib.sha256(path.read_bytes()).hexdigest()
     for path in (
@@ -371,6 +374,9 @@ RUNTIME_MANIFEST: dict[str, Any] = {
         "session_end": SESSION_END.isoformat(),
         "entry_cutoff_guard_seconds": ENTRY_CUTOFF_GUARD_SECONDS,
         "full_scan_every_seconds": FULL_SCAN_EVERY_SECONDS,
+        "full_scan_error_backoff_max_seconds": (
+            FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS
+        ),
         "position_monitor_every_seconds": POSITION_MONITOR_EVERY_SECONDS,
     },
     "data": {
@@ -395,6 +401,10 @@ RUNTIME_CONFIG_FINGERPRINT = hashlib.sha256(
 # =============================================================================
 # Models
 # =============================================================================
+
+class HistoricalCandleError(RuntimeError):
+    """Historical market data failed; abort this entry scan fail-closed."""
+
 
 @dataclass
 class Instrument:
@@ -989,6 +999,21 @@ def validate_configuration() -> None:
         errors.append("MAX_WS_DISCONNECT_SECONDS must be positive")
     if INDICATOR_LOOKBACK_DAYS < 7:
         errors.append("INDICATOR_LOOKBACK_DAYS must be at least 7")
+    if FULL_SCAN_EVERY_SECONDS < 1 or POSITION_MONITOR_EVERY_SECONDS < 1:
+        errors.append("scan and position-monitor intervals must be positive")
+    if not (
+        FULL_SCAN_EVERY_SECONDS
+        <= FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS
+        <= 3600
+    ):
+        errors.append(
+            "FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS must be at least "
+            "FULL_SCAN_EVERY_SECONDS and no greater than 3600"
+        )
+    if CANDLE_DELAY_SECONDS < (1 / 3):
+        errors.append(
+            "CANDLE_DELAY_SECONDS must respect Kite's 3 requests/second limit"
+        )
     if not 0 <= CANDLE_CLOSE_GRACE_SECONDS <= 30:
         errors.append("CANDLE_CLOSE_GRACE_SECONDS must be between 0 and 30")
     if not 0 <= ENTRY_CUTOFF_GUARD_SECONDS < 300:
@@ -1005,6 +1030,7 @@ def validate_configuration() -> None:
         "CIRCUIT_HEADROOM_BPS": CIRCUIT_HEADROOM_BPS,
         "PAPER_SLIPPAGE_BPS": PAPER_SLIPPAGE_BPS,
         "RISK_SLIPPAGE_BPS": RISK_SLIPPAGE_BPS,
+        "CANDLE_DELAY_SECONDS": CANDLE_DELAY_SECONDS,
         "CANDLE_CLOSE_GRACE_SECONDS": CANDLE_CLOSE_GRACE_SECONDS,
         "MIN_RVOL": MIN_RVOL,
         "MIN_OPENING_RVOL": MIN_OPENING_RVOL,
@@ -1649,6 +1675,48 @@ def market_timestamp(value: Any, *, field: str) -> pd.Timestamp:
     else:
         timestamp = timestamp.tz_convert(IST)
     return timestamp
+
+
+def kite_historical_request_dates(
+    start: Any,
+    end: Any,
+) -> tuple[str, str]:
+    """Return an IST range in Kite's exact historical-API wire format.
+
+    ``kiteconnect`` only formats values whose concrete type is the built-in
+    ``datetime``. A pandas ``Timestamp`` is a datetime subclass but fails that
+    exact-type check and would otherwise be serialized with ``+05:30``, which
+    Kite rejects as an invalid ``from`` date. Format explicitly at the adapter
+    boundary so SDK implementation details and the host timezone cannot alter
+    the request.
+    """
+    start_at = market_timestamp(
+        start,
+        field="historical.from_date",
+    ).floor("s")
+    end_at = market_timestamp(
+        end,
+        field="historical.to_date",
+    ).floor("s")
+    if start_at >= end_at:
+        raise ValueError("historical.from_date must be earlier than to_date")
+    wire_format = "%Y-%m-%d %H:%M:%S"
+    return start_at.strftime(wire_format), end_at.strftime(wire_format)
+
+
+def full_scan_retry_delay_seconds(consecutive_failures: int) -> int:
+    """Return a capped exponential delay for repeated scan-level failures."""
+    if (
+        isinstance(consecutive_failures, bool)
+        or not isinstance(consecutive_failures, int)
+        or consecutive_failures < 1
+    ):
+        raise ValueError("consecutive scan failures must be a positive integer")
+    exponent = min(consecutive_failures - 1, 20)
+    return min(
+        FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS,
+        FULL_SCAN_EVERY_SECONDS * (2 ** exponent),
+    )
 
 
 def latest_eligible_5m_bar_start(as_of: Any) -> pd.Timestamp:
@@ -2635,14 +2703,28 @@ class KiteBroker:
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        rows = self.kite.historical_data(
-            instrument_token=token,
-            from_date=start,
-            to_date=end,
-            interval="5minute",
-            continuous=False,
-            oi=False,
+        instrument_token = strict_integral(
+            token,
+            field="historical.instrument_token",
         )
+        if instrument_token <= 0:
+            raise ValueError("historical.instrument_token must be positive")
+        from_date, to_date = kite_historical_request_dates(start, end)
+        try:
+            rows = self.kite.historical_data(
+                instrument_token=instrument_token,
+                from_date=from_date,
+                to_date=to_date,
+                interval="5minute",
+                continuous=False,
+                oi=False,
+            )
+        except Exception as exc:
+            raise HistoricalCandleError(
+                "Kite historical request failed "
+                f"token={instrument_token} from={from_date} to={to_date}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
         if not rows:
             return pd.DataFrame()
@@ -8103,6 +8185,10 @@ def scan_for_new_trades(
 
             qualified.append(setup)
 
+        except HistoricalCandleError:
+            # A shared market-data dependency has failed. Do not issue the same
+            # request for every remaining candidate in this scan.
+            raise
         except Exception as exc:
             log(
                 f"{quote.symbol}: "
@@ -8569,6 +8655,7 @@ def _run_main() -> None:
             log("AI shadow review unavailable; deterministic paper logic continues.")
 
         next_full_scan = 0.0
+        consecutive_scan_failures = 0
         next_monitor = 0.0
         next_pnl_check = 0.0
         ws_disconnect_since: float | None = None
@@ -8697,15 +8784,28 @@ def _run_main() -> None:
                     )
 
                 except Exception as exc:
+                    consecutive_scan_failures += 1
+                    scan_delay = full_scan_retry_delay_seconds(
+                        consecutive_scan_failures
+                    )
                     log(
                         "Full market scan error: "
                         f"{type(exc).__name__}: "
-                        f"{exc}"
+                        f"{exc}; next attempt in {scan_delay}s"
                     )
+
+                else:
+                    if consecutive_scan_failures:
+                        log(
+                            "Full market scan recovered after "
+                            f"{consecutive_scan_failures} failure(s)."
+                        )
+                    consecutive_scan_failures = 0
+                    scan_delay = FULL_SCAN_EVERY_SECONDS
 
                 next_full_scan = (
                     time.monotonic()
-                    + FULL_SCAN_EVERY_SECONDS
+                    + scan_delay
                 )
 
             time.sleep(1)

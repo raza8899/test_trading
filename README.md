@@ -1,4 +1,4 @@
-# Zerodha Kite + GPT AI Intraday Bot V3.8
+# Zerodha Kite + GPT AI Intraday Bot V3.8.1
 
 This project scans NSE cash equities for intraday opening-range breakouts and
 manages paper or Zerodha Kite orders through a hard risk layer. GPT is an
@@ -404,12 +404,21 @@ The deterministic candidate logic uses:
 The candle request, incomplete-bar filter, and continuity validator share one
 captured timestamp. A bar is eligible only after its full five-minute interval
 plus `CANDLE_CLOSE_GRACE_SECONDS`; missing, duplicate, misaligned, malformed, or
-unexpected current-session bars make the scan fail closed. Immediately before
-entry intent, LONG uses the best ask and SHORT uses the best bid. Exchange quote
-age must remain within `MAX_EXECUTION_QUOTE_AGE_SECONDS`, and every drift check
-is measured from the immutable signal-candle close rather than the prior refresh.
+unexpected current-session bars make the scan fail closed. Historical request
+bounds are normalized to IST and serialized explicitly as
+`YYYY-MM-DD HH:MM:SS`; this avoids host-timezone differences and the Kite SDK's
+incompatible serialization of pandas timestamps. Immediately before entry
+intent, LONG uses the best ask and SHORT uses the best bid. Exchange quote age
+must remain within `MAX_EXECUTION_QUOTE_AGE_SECONDS`, and every drift check is
+measured from the immutable signal-candle close rather than the prior refresh.
 These controls remove known look-ahead and stale-entry paths; they do not prove
 that the strategy has positive expectancy.
+
+A historical-data failure aborts the entire entry scan rather than repeating
+the same failed request for every candidate. Repeated scan-level failures use a
+capped exponential schedule up to `FULL_SCAN_ERROR_BACKOFF_MAX_SECONDS`; a
+successful scan resets the delay. Position monitoring, P&L enforcement, and
+forced-exit handling continue at their independent cadence during this backoff.
 
 Default ceilings for `CAPITAL_LIMIT=100000` are approximately ₹200 planned risk
 per stopped trade, ₹25,000 maximum position notional, ₹400 aggregate open-stop
