@@ -93,10 +93,24 @@ execution loop and preserves the cleanest deterministic paper baseline.
 | `gate` | Calls OpenAI synchronously and requires approval plus configured thresholds; errors fail closed. | Guarded paper/live use after execution-path validation. |
 
 Online reviews are capped by `MAX_AI_REVIEWS_PER_SCAN`. Successful API reviews
-record an input hash, decision ID, actual response model/ID, latency, and basic
-token counts. Skipped, unavailable, or failed reviews record `ERROR` and a
-status/reason, but provider response metadata may be blank and usage may be
-zero. The completed-trade `ERROR` cohort is not a count of every API failure.
+use a strict compact `AIDecision`: `decision` is exactly `APPROVE` or `REJECT`,
+both scores are integers from 0 through 100, `reason` is one short sentence of
+at most 250 characters, and `risk_flags` contains at most four standardized
+machine-readable labels. The request keeps low reasoning effort, uses low output
+verbosity, and allows at most 400 output tokens, including reasoning tokens. It
+does not request or journal chain-of-thought.
+
+Operational failures are represented separately as the internal `ERROR`
+outcome; `ERROR` is not part of the provider-visible structured schema. In
+`AI_MODE=gate`, missing, malformed, truncated, unavailable, or otherwise failed
+AI output remains fail-closed and cannot become an approval. In `shadow`, the
+label remains execution-neutral as described above. The completed-trade
+`ERROR` cohort is not a count of every failed API call.
+
+Every `AI_REVIEW` journal event records its input hash, decision ID, actual
+response model/ID, latency, API-call/reuse status, and the available input,
+cached-input, cache-write, output, reasoning, and total token counts. Skipped or
+unavailable reviews may have blank provider metadata and zero usage.
 
 AI receives structured candidate features; it does not predict fills or know
 the future. It cannot change quantity, stop distance, maximum position size,
@@ -110,6 +124,129 @@ snapshot when one is available to the account, retain the actual response model
 in provenance, and never combine changed model/prompt/config cohorts as if they
 were one experiment. See the official
 [GPT-5.6 Sol model page](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+
+### OpenAI prompt-prefix caching
+
+The online reviewer enables OpenAI prompt-prefix caching by default:
+
+```dotenv
+OPENAI_PROMPT_CACHE_ENABLED=true
+OPENAI_PROMPT_CACHE_TTL=30m
+```
+
+For supported GPT-5.6 models, the request places an explicit cache breakpoint
+after the static system instructions and uses the currently supported `30m`
+TTL. The anonymous candidate JSON remains the final dynamic suffix and is
+serialized deterministically. Disabling caching omits the cache key, breakpoint,
+and cache options; an unsupported model degrades to the provider's default
+key-only behavior instead of preventing a review. The explicit breakpoint keeps
+the changing candidate suffix out of cache writes while maximizing reuse of the
+large, identical review-instruction prefix.
+
+The cache key is stable across candidates and contains no symbol, token,
+timestamp, trade/idea ID, account state, or candidate value. It is derived from
+the workflow, requested model, prompt version, system-prompt hash, and structured
+schema hash, so a model, prompt, or schema change creates a different namespace.
+The resulting key is at most 64 characters. Do not replace it with a symbol- or
+signal-specific key.
+
+Provider caching is eligible only when the cacheable prefix reaches at least
+1,024 tokens. A stable key or a sent cache option does not prove a cache hit.
+Typically, the first eligible request writes the prefix and reports
+`cache_write_tokens > 0`; a later compatible request routed within the TTL can
+report `cached_input_tokens > 0`. Eviction, routing, prompt changes, or an
+ineligible prefix can still produce zero cached tokens. See the official
+[OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+for the current provider semantics.
+
+The only production proof used by this repository is provider-reported
+`cached_input_tokens > 0`. Check a completed session with:
+
+```bash
+.venv/bin/python performance_report.py logs/trades_YYYYMMDD.jsonl --json
+rg '"ai_cached_input_tokens":\s*[1-9][0-9]*' logs/trades_YYYYMMDD.jsonl
+```
+
+In the JSON report inspect `ai_usage.cached_input_tokens`,
+`ai_usage.cache_hit_rate`, and `ai_usage.cache_backend_verified`. Each graceful
+shutdown also logs one concise `AI USAGE:` line and journals an
+`AI_USAGE_SUMMARY`. Per-call `AI_REVIEW` records remain the more durable source
+if a process cannot perform its normal shutdown. Neither a cache write nor a
+cache hit says anything about review quality or strategy profitability.
+
+### Duplicate-review suppression
+
+OpenAI prefix caching still performs an inference for every request. Separately,
+the online reviewer can reuse a successfully parsed decision within the current
+process only when both the immutable signal identity and the exact anonymous
+review-payload hash match. Signal identity includes strategy/config identity,
+symbol, side, and signal-candle timestamp. A changed candle, live price, spread,
+age, economics, or any other payload value receives a fresh inference. Provider
+errors are not cached as decisions.
+
+A reuse is journalled as `review_status=DUPLICATE_REUSED`,
+`duplicate_review_suppressed=true`, and `api_called=false`; it consumes no
+per-scan API-call budget and must not be counted again in token totals. This is
+an in-memory process-session optimization, not a persistent response cache.
+
+### AI review benchmark and captures
+
+The deterministic offline benchmark compares legacy and compact reviews by case
+identity and exact input hash. It never contacts Kite, imports the trading bot,
+or treats missing compact results as an improvement. Run the checked-in baseline
+inspection with:
+
+```bash
+.venv/bin/python ai_review_benchmark.py --json
+```
+
+Until real compact results have been captured, this intentionally exits with
+status 2 and `INSUFFICIENT_COMPACT_RESULTS`. Capturing compact results is an
+explicit OpenAI API action and incurs OpenAI cost. It never calls Kite or places
+an order. The command requires `OPENAI_API_KEY` to be exported in its process
+environment; it does not load `.env`. After reviewing the cases and accepting
+that cost, run:
+
+```bash
+.venv/bin/python capture_ai_review_benchmark.py \
+  --confirm OPENAI_COST_ACCEPTED \
+  --output benchmarks/captures/compact-results.jsonl
+```
+
+The capture file is written owner-only and must remain untracked. Then compare
+it with the optional, source-linked pricing template:
+
+```bash
+.venv/bin/python ai_review_benchmark.py \
+  --compact-results benchmarks/captures/compact-results.jsonl \
+  --pricing benchmarks/openai_pricing.example.json \
+  --json
+```
+
+Pricing output is only an estimate and never affects a review or trade. The
+checked-in template deliberately has null rates and an unset effective date;
+populate it only from pricing you have independently verified. The
+benchmark compares parse and gate-decision consistency, scores, reason length,
+output/cache tokens, latency, and estimated cost where the required observations
+exist. It must not invent missing token, latency, or cache-hit measurements.
+
+One trend-conflict case is an explicit synthetic perturbation and has no
+fabricated legacy response. Therefore, even a complete compact capture honestly
+reports `INSUFFICIENT_LEGACY_RESULTS` for the all-case comparison while still
+showing metrics for every real exact-hash pair.
+
+Real capture output is intentionally caller-selected and
+`benchmarks/captures/` is gitignored because captures can contain
+provenance-sensitive review data and incur API cost. Inspect the capture command
+before using it:
+
+```bash
+.venv/bin/python capture_ai_review_benchmark.py --help
+```
+
+Run capture only as this explicit offline evaluation action. A compact benchmark
+can test decision consistency and token reduction, but cannot establish a
+profitable strategy or justify enabling live trading.
 
 ## Research-only AI trade ideas
 
@@ -198,6 +335,13 @@ factor, maximum drawdown, average R, and separate AI `APPROVE`, `REJECT`, and
 `ERROR` cohorts. `OFF` trades count overall but never in an AI cohort. Results
 are also split into execution-mode/config-fingerprint experiment cohorts; a
 mixed overall or AI aggregate is labelled as non-comparable.
+
+The report separately aggregates every `AI_REVIEW`, including rejected and
+failed reviews that never became completed trades. Its `ai_usage` section shows
+actual API calls, successes/errors, exact-payload duplicate reuse, available
+token totals, average output/latency, cache hit rate, and whether any provider
+cache hit was observed. Missing legacy usage remains `N/A`; it is never inferred
+as zero to make caching or cost look better.
 
 Only `CLOSE` records with explicit finite P&L, fees, and R-multiple fields are
 used. AI attribution must be `APPROVE`, `REJECT`, `ERROR`, or `OFF`; a missing

@@ -466,6 +466,27 @@ class AIFilterContractTests(unittest.TestCase):
         self.assertEqual(reviewer.last_status, "ERROR")
         self.assertEqual(reviewer.usage_totals.failed_calls, 1)
 
+    def test_missing_parsed_output_fails_closed_and_is_never_cached(self) -> None:
+        missing = SimpleNamespace(
+            output_parsed=None,
+            model="gpt-5.6-sol-2026-08-01",
+            id="resp-truncated",
+            usage=None,
+        )
+        reviewer, client = self._reviewer([missing, self._response()])
+        payload = {"setup": {"rvol": 2.0}}
+        key = ("strategy", "INFY", "LONG", "2026-08-27T10:00:00+05:30")
+
+        with mock.patch.object(bot, "log"):
+            first = reviewer.review(payload, review_key=key)
+        second = reviewer.review(payload, review_key=key)
+
+        self.assertEqual(first.decision, "ERROR")
+        self.assertEqual(second.decision, "APPROVE")
+        self.assertEqual(client.responses.parse.call_count, 2)
+        self.assertEqual(reviewer.usage_totals.failed_calls, 1)
+        self.assertEqual(reviewer.usage_totals.successful_calls, 1)
+
     def test_exact_duplicate_is_reused_but_new_signal_calls_provider(self) -> None:
         reviewer, client = self._reviewer(
             [self._response(), self._response()]
@@ -994,6 +1015,19 @@ class StrategyHelperSafetyTests(unittest.TestCase):
         broker = FakeBroker(price=100.5)
         original = make_trade()
         original.idea_id = "reviewed-idea"
+        original.ai_review_idea_id = "review-idea"
+        original.ai_prompt_version = bot.AI_PROMPT_VERSION
+        original.ai_input_sha256 = "input-hash"
+        original.ai_source_input_sha256 = "source-input-hash"
+        original.ai_input_tokens = 1200
+        original.ai_cached_input_tokens = 896
+        original.ai_cache_write_tokens = 128
+        original.ai_output_tokens = 160
+        original.ai_reasoning_tokens = 80
+        original.ai_total_tokens = 1360
+        original.ai_cache_hit_ratio = 896 / 1200
+        original.ai_api_called = True
+        original.ai_duplicate_review_suppressed = False
         setup = replace(make_setup(), price=100.5)
         capacity = bot.entry_capacity(bot.fresh_state())
 
@@ -1009,6 +1043,25 @@ class StrategyHelperSafetyTests(unittest.TestCase):
         self.assertEqual(result.trade.entry_price, 100.5)
         self.assertLessEqual(result.trade.qty, original.requested_qty)
         self.assertEqual(result.trade.idea_id, "reviewed-idea")
+        for field_name in (
+            "ai_review_idea_id",
+            "ai_prompt_version",
+            "ai_input_sha256",
+            "ai_source_input_sha256",
+            "ai_input_tokens",
+            "ai_cached_input_tokens",
+            "ai_cache_write_tokens",
+            "ai_output_tokens",
+            "ai_reasoning_tokens",
+            "ai_total_tokens",
+            "ai_cache_hit_ratio",
+            "ai_api_called",
+            "ai_duplicate_review_suppressed",
+        ):
+            self.assertEqual(
+                getattr(result.trade, field_name),
+                getattr(original, field_name),
+            )
         self.assertLessEqual(
             result.trade.reserved_risk_amount,
             capacity.candidate_risk_budget,
@@ -1351,6 +1404,32 @@ class ConfigurationSafetyTests(unittest.TestCase):
 
         with mock.patch.object(bot, "CANDLE_DELAY_SECONDS", 0.1):
             with self.assertRaisesRegex(RuntimeError, "3 requests/second"):
+                bot.validate_configuration()
+
+    def test_prompt_cache_configuration_is_strict_and_manifested(self) -> None:
+        self.assertEqual(
+            bot.RUNTIME_MANIFEST["ai"]["prompt_cache_enabled"],
+            bot.OPENAI_PROMPT_CACHE_ENABLED,
+        )
+        self.assertEqual(
+            bot.RUNTIME_MANIFEST["ai"]["prompt_cache_ttl"],
+            bot.OPENAI_PROMPT_CACHE_TTL,
+        )
+        with mock.patch.object(
+            bot,
+            "OPENAI_PROMPT_CACHE_ENABLED_RAW",
+            "yes",
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "OPENAI_PROMPT_CACHE_ENABLED",
+            ):
+                bot.validate_configuration()
+        with mock.patch.object(bot, "OPENAI_PROMPT_CACHE_TTL", "24h"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "OPENAI_PROMPT_CACHE_TTL",
+            ):
                 bot.validate_configuration()
 
 

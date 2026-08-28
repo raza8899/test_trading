@@ -1,0 +1,12 @@
+{
+  "schema_version": "ai-review-pricing-v1",
+  "currency": "USD",
+  "source_url": "https://developers.openai.com/api/docs/pricing",
+  "effective_at": null,
+  "rates_per_million_tokens": {
+    "uncached_input": null,
+    "cached_input": null,
+    "cache_write_input": null,
+    "output": null
+  }
+}

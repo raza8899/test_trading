@@ -1042,6 +1042,14 @@ def format_text_report(report: dict[str, Any]) -> str:
                 else "N/A (not recorded)"
             )
         ),
+        (
+            "AI cache backend verified: "
+            + (
+                "yes (cached_input_tokens > 0 observed)"
+                if ai_usage["cache_backend_verified"]
+                else "no"
+            )
+        ),
         "",
     ]
     overall_title = (

@@ -107,7 +107,9 @@ class PerformanceReportTests(unittest.TestCase):
                 usage["diagnostics"]["duplicate_review_events"],
                 1,
             )
-            self.assertIn("AI cache hit rate: 53.3%", performance_report.format_text_report(report))
+            rendered = performance_report.format_text_report(report)
+            self.assertIn("AI cache hit rate: 53.3%", rendered)
+            self.assertIn("AI cache backend verified: yes", rendered)
 
     def test_malformed_ai_usage_never_changes_valid_pnl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
